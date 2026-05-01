@@ -11,8 +11,10 @@
 #pragma once
 
 #include <rex/input/input_driver.h>
+#include <rex/ui/virtual_key.h>
 #include <rex/ui/window_listener.h>
 
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <queue>
@@ -51,13 +53,45 @@ class MnkInputDriver final : public InputDriver,
   void OnLostFocus(rex::ui::UISetupEvent& e) override;
   void OnGotFocus(rex::ui::UISetupEvent& e) override;
 
+  // Per-pad-button slot index for keystroke edge tracking and repeat timing.
+  enum PadIdx {
+    kPadIdxA = 0,
+    kPadIdxB,
+    kPadIdxX,
+    kPadIdxY,
+    kPadIdxLB,
+    kPadIdxRB,
+    kPadIdxStart,
+    kPadIdxBack,
+    kPadIdxL3,
+    kPadIdxR3,
+    kPadIdxDU,
+    kPadIdxDD,
+    kPadIdxDL,
+    kPadIdxDR,
+    kPadIdxLT,
+    kPadIdxRT,
+    kPadIdxLStick,
+    kPadIdxRStick,
+    kPadIdxCount
+  };
+
  private:
   uint32_t UserIndex() const;
   bool IsEnabled() const;
   void CenterCursor();
   void UpdateMouseCapture();
   void SetKeyState(uint16_t vk, bool down);
-  void EnqueueKeystroke(uint16_t vk_pad, bool down);
+  // PR #311: flags = X_INPUT_KEYSTROKE_KEYDOWN / KEYUP / REPEAT, etc.
+  // dpour: kept our old simpler signature replaced by the flags version
+  // since our HEAD had no live callers — purely a header decl.
+  void EnqueueKeystroke(uint16_t vk_pad, uint16_t flags);
+  void HandleEdge(PadIdx idx, uint16_t vk_pad, bool down);
+  void HandleStickDirChange(PadIdx idx, uint16_t new_dir);
+  void EmitButtonChange(rex::ui::VirtualKey key_vk, bool down);
+  void RecomputeLstickDir();
+  void EnqueueRStickIfChanged(int16_t rx, int16_t ry);
+  void TickRepeats();
   void ClearStateLocked();
 
   rex::ui::Window* attached_window_ = nullptr;
@@ -86,6 +120,17 @@ class MnkInputDriver final : public InputDriver,
   // stationary so a brief flick still has a clean tail.
   double mouse_stick_x_ = 0.0;
   double mouse_stick_y_ = 0.0;
+
+  // PR #311: per-pad-button state for KEYDOWN/KEYUP edge tracking and
+  // KEYSTROKE_REPEAT timing. Stick slots store the currently-held direction
+  // as vk_pad. ClearStateLocked() must reset these alongside key_down_.
+  struct PadKeyState {
+    bool held = false;
+    uint16_t vk_pad = 0;  // VirtualKey value, 0 = kNone
+    std::chrono::steady_clock::time_point pressed_at;
+    std::chrono::steady_clock::time_point last_event_at;
+  };
+  PadKeyState pad_states_[kPadIdxCount];
 
   // Packet number incremented on state change
   uint32_t packet_number_ = 0;
