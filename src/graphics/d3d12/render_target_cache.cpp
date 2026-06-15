@@ -3287,6 +3287,19 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
                       dest_color_format ==
                           xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16)) {
             a.OpMov(dxbc::Dest::O(0), dxbc::Src::R(1));
+          } else if (dest_is_color &&
+                     (dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
+                      dest_color_format ==
+                          xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA)) {
+            // DP1 fix: HDR (7e3) -> 8888 ownership transfer with value-clipping
+            // instead of bit-preservation. Without this, the raw 7e3 bits get
+            // unpacked as UNORM8 garbage, which then leaks through subsequent
+            // tonemap+alpha-blend passes wherever src.a == 0 (alpha-tested hair,
+            // foliage, statue billboards in Deadly Premonition), producing the
+            // visible rainbow speckles. Saturating HDR floats to [0, 1] and
+            // writing them directly as UNORM8 leaves clipped-HDR-looking
+            // residue at alpha-test pixels instead of rainbow noise.
+            a.OpMov(dxbc::Dest::O(0), dxbc::Src::R(1), true);
           } else {
             color_packed_in_r1x = true;
             // Float16 has a wider range for both color and alpha, also NaNs -
