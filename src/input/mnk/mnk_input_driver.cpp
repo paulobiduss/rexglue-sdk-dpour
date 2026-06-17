@@ -112,12 +112,67 @@ void MnkInputDriver::ClearStateLocked() {
   mouse_dy_ = 0;
 }
 
-static bool IsBindPressed(const bool (&key_down)[256], const std::string& cvar_val) {
-  VirtualKey vk = rex::ui::ParseVirtualKey(cvar_val);
+// Trim ASCII whitespace from both ends of [first, last). Returns the new range.
+static std::string_view TrimAsciiSpace(std::string_view s) {
+  size_t a = 0;
+  while (a < s.size() && std::isspace(static_cast<unsigned char>(s[a])))
+    ++a;
+  size_t b = s.size();
+  while (b > a && std::isspace(static_cast<unsigned char>(s[b - 1])))
+    --b;
+  return s.substr(a, b - a);
+}
+
+static bool IsSingleKeyDown(const bool (&key_down)[256], std::string_view key_name) {
+  std::string trimmed_owned(TrimAsciiSpace(key_name));
+  if (trimmed_owned.empty())
+    return false;
+  VirtualKey vk = rex::ui::ParseVirtualKey(trimmed_owned);
   if (vk == VirtualKey::kNone)
     return false;
   uint16_t idx = static_cast<uint16_t>(vk);
   return idx < 256 && key_down[idx];
+}
+
+// Evaluates a bind expression. Supports:
+//   "E"               -> A is pressed iff E is down.
+//   "E,LMB"           -> A is pressed iff E OR LMB is down.
+//   "Space+LMB"       -> A is pressed iff Space AND LMB are both down.
+//   "E,Space+LMB"     -> A is pressed iff E is down OR (Space AND LMB) are down.
+// Whitespace inside tokens is trimmed. Empty / unparsable tokens silently
+// disqualify their containing AND-group.
+static bool IsBindPressed(const bool (&key_down)[256], const std::string& cvar_val) {
+  std::string_view rest = cvar_val;
+  while (!rest.empty()) {
+    size_t comma = rest.find(',');
+    std::string_view group =
+        TrimAsciiSpace(rest.substr(0, comma == std::string_view::npos ? rest.size() : comma));
+    rest = (comma == std::string_view::npos) ? std::string_view{} : rest.substr(comma + 1);
+
+    if (group.empty())
+      continue;
+
+    bool all_down = true;
+    bool any_key = false;
+    std::string_view inner = group;
+    while (!inner.empty()) {
+      size_t plus = inner.find('+');
+      std::string_view key =
+          TrimAsciiSpace(inner.substr(0, plus == std::string_view::npos ? inner.size() : plus));
+      inner = (plus == std::string_view::npos) ? std::string_view{} : inner.substr(plus + 1);
+      if (key.empty())
+        continue;
+      any_key = true;
+      if (!IsSingleKeyDown(key_down, key)) {
+        all_down = false;
+        break;
+      }
+    }
+
+    if (any_key && all_down)
+      return true;
+  }
+  return false;
 }
 
 X_RESULT MnkInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
@@ -167,6 +222,22 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
 
   std::lock_guard lock(state_mutex_);
 
+  // Drain one mouse-wheel detent per poll and pulse the synthetic
+  // kWheelUp / kWheelDown keys for exactly this frame so binds referencing
+  // "WheelUp" / "WheelDown" register as one button press per scroll detent.
+  constexpr int32_t kWheelDetent = 120;  // MouseEvent::kScrollPerDetent
+  bool wheel_up_pulse = false;
+  bool wheel_down_pulse = false;
+  if (wheel_accumulator_y_ >= kWheelDetent) {
+    wheel_accumulator_y_ -= kWheelDetent;
+    wheel_up_pulse = true;
+  } else if (wheel_accumulator_y_ <= -kWheelDetent) {
+    wheel_accumulator_y_ += kWheelDetent;
+    wheel_down_pulse = true;
+  }
+  key_down_[static_cast<uint8_t>(rex::ui::VirtualKey::kWheelUp)] = wheel_up_pulse;
+  key_down_[static_cast<uint8_t>(rex::ui::VirtualKey::kWheelDown)] = wheel_down_pulse;
+
   uint16_t buttons = 0;
   if (IsBindPressed(key_down_, REXCVAR_GET(keybind_a)))
     buttons |= X_INPUT_GAMEPAD_A;
@@ -215,10 +286,47 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
 
   double sensitivity = REXCVAR_GET(mnk_sensitivity);
   constexpr double kBaseScale = 200.0;
-  int32_t rx = static_cast<int32_t>(mouse_dx_ * sensitivity * kBaseScale);
-  int32_t ry = static_cast<int32_t>(-mouse_dy_ * sensitivity * kBaseScale);
+  double new_rx = static_cast<double>(mouse_dx_) * sensitivity * kBaseScale;
+  double new_ry = -static_cast<double>(mouse_dy_) * sensitivity * kBaseScale;
   mouse_dx_ = 0;
   mouse_dy_ = 0;
+
+  // Combine fresh mouse motion with the decaying virtual stick. This lets a
+  // brief flick of the mouse keep the simulated stick deflected for ~10-15
+  // polls (~160-250 ms at 60 Hz) so the camera can complete a full 360°
+  // sweep on a finite mouse pad. Without this, the stick re-centers the
+  // instant the mouse stops moving, and the user has to drag the mouse
+  // continuously to keep the camera turning.
+  constexpr double kInt16Max = 32767.0;
+  constexpr double kDecayPerPoll = 0.85;  // ~15% loss/poll, ~250 ms full decay at 60 Hz
+  if (new_rx != 0.0 && std::abs(new_rx) > std::abs(mouse_stick_x_)) {
+    mouse_stick_x_ = std::clamp(new_rx, -kInt16Max, kInt16Max);
+  } else {
+    mouse_stick_x_ *= kDecayPerPoll;
+    if (std::abs(mouse_stick_x_) < 1.0) mouse_stick_x_ = 0.0;
+  }
+  if (new_ry != 0.0 && std::abs(new_ry) > std::abs(mouse_stick_y_)) {
+    mouse_stick_y_ = std::clamp(new_ry, -kInt16Max, kInt16Max);
+  } else {
+    mouse_stick_y_ *= kDecayPerPoll;
+    if (std::abs(mouse_stick_y_) < 1.0) mouse_stick_y_ = 0.0;
+  }
+
+  // Deadzone compensation. Many guests treat anything below
+  // XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE (8689) as "stick centered" and ignore
+  // it. Remap (0, INT16_MAX] -> [kDeadzoneFloor, INT16_MAX] so the smallest
+  // non-zero stick value already registers above the game's deadzone.
+  constexpr double kDeadzoneFloor = 9500.0;  // slightly above 8689
+  auto remap_axis = [&](double v) -> int32_t {
+    if (v == 0.0)
+      return 0;
+    double mag = std::abs(v);
+    double clamped = std::min(mag, kInt16Max);
+    double scaled = kDeadzoneFloor + clamped * (kInt16Max - kDeadzoneFloor) / kInt16Max;
+    return static_cast<int32_t>(std::copysign(scaled, v));
+  };
+  int32_t rx = remap_axis(mouse_stick_x_);
+  int32_t ry = remap_axis(mouse_stick_y_);
 
   auto clamp16 = [](int32_t v) -> int16_t {
     return static_cast<int16_t>(std::clamp(v, (int32_t)INT16_MIN, (int32_t)INT16_MAX));
@@ -400,6 +508,13 @@ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
   mouse_dy_ += y - prev_mouse_y_;
   prev_mouse_x_ = x;
   prev_mouse_y_ = y;
+}
+
+void MnkInputDriver::OnMouseWheel(rex::ui::MouseEvent& e) {
+  if (!IsEnabled() || !has_focus_)
+    return;
+  std::lock_guard lock(state_mutex_);
+  wheel_accumulator_y_ += e.scroll_y();
 }
 
 void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {

@@ -44,6 +44,7 @@ class MnkInputDriver final : public InputDriver,
   void OnMouseDown(rex::ui::MouseEvent& e) override;
   void OnMouseUp(rex::ui::MouseEvent& e) override;
   void OnMouseMove(rex::ui::MouseEvent& e) override;
+  void OnMouseWheel(rex::ui::MouseEvent& e) override;
 
   // WindowListener
   void OnClosing(rex::ui::UIEvent& e) override;
@@ -74,6 +75,18 @@ class MnkInputDriver final : public InputDriver,
 
   // Keystroke queue
   std::queue<X_INPUT_KEYSTROKE> keystroke_queue_;
+
+  // Vertical mouse-wheel accumulator (Windows WHEEL_DELTA units, 120/detent).
+  // Drained one detent per GetState poll, pulses kWheelUp/kWheelDown for one
+  // frame each. Lets the wheel be bound to any controller button.
+  int32_t wheel_accumulator_y_ = 0;
+
+  // Right-stick virtual value that decays toward zero after mouse motion
+  // stops, so a brief flick of the mouse keeps the simulated stick deflected
+  // for a few polls. This is what lets the user spin the camera 360° with
+  // a finite mouse pad instead of having to drag continuously.
+  double mouse_stick_x_ = 0.0;
+  double mouse_stick_y_ = 0.0;
 
   // Packet number incremented on state change
   uint32_t packet_number_ = 0;
