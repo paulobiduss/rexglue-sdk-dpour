@@ -47,6 +47,16 @@ class ImGuiDialog {
   // burning CPU/GPU.
   virtual bool WantsContinuousRepaint() const { return true; }
 
+  // Whether the dialog wants to consume mouse/keyboard input — i.e. the user
+  // is actively interacting with it. Default true (safe choice for new
+  // dialogs); passive readouts (FPS counter, debug overlay) override to false.
+  // Used by the input-system "is_active" callback to release MnK mouse capture
+  // (un-hide the cursor, stop CenterCursor) whenever an interactive dialog is
+  // on screen. Without this, MnK's per-frame CenterCursor prevents the cursor
+  // from ever reaching an interactive dialog, so ImGui's WantCaptureMouse hover
+  // check never fires and the user can't actually use the dialog.
+  virtual bool WantsInputCapture() const { return true; }
+
  protected:
   ImGuiDialog(ImGuiDrawer* imgui_drawer);
 

@@ -23,6 +23,7 @@
 #include <rex/ui/overlay/debug_overlay.h>
 #include <rex/ui/overlay/fps_overlay.h>
 #include <rex/ui/overlay/settings_overlay.h>
+#include <rex/ui/overlay/shader_compile_overlay.h>
 #include <rex/graphics/graphics_system.h>
 #if REX_HAS_VULKAN
 #include <rex/graphics/vulkan/graphics_system.h>
@@ -449,6 +450,14 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
     if (input_sys) {
       input_sys->SetActiveCallback([this]() {
+        // SetActiveCallback drives ALL input drivers (MnK + SDL gamepad +
+        // any future ones) — returning false here disables real-controller
+        // input too, not just MnK. So this callback uses the conservative
+        // "ImGui actually wants this event" check; the MnK-specific cursor
+        // release for interactive dialogs is handled separately inside
+        // MnkInputDriver::UpdateMouseCapture (via ImGuiDrawer::
+        // HasInputCapturingDialog()), so opening F4 settings does not
+        // disable controller input.
         if (!imgui_drawer_->HasDialogs()) {
           return true;
         }
@@ -635,26 +644,65 @@ void ReXApp::LaunchModule() {
 
     auto* graphics_system =
         static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
-    if (graphics_system && !runtime_->cache_root().empty()) {
-      uint32_t title_id = runtime_->kernel_state()->title_id();
-      if (title_id != 0) {
-        REXLOG_INFO("Initializing shader storage for title {:08X}...", title_id);
-        graphics_system->InitializeShaderStorage(runtime_->cache_root(), title_id,
-                                                kBlockShaderStorageStartup);
-      }
+    const bool has_shader_storage =
+        graphics_system && !runtime_->cache_root().empty() &&
+        runtime_->kernel_state()->title_id() != 0;
+
+    if (!has_shader_storage) {
+      FinishModuleLaunch(std::move(main_thread));
+      return;
     }
 
-    OnPostLaunchModule(main_thread.get());
-    main_thread->Resume();
+    const uint32_t title_id = runtime_->kernel_state()->title_id();
+    REXLOG_INFO("Initializing shader storage for title {:08X}...", title_id);
 
-    module_thread_ = std::thread([this, main_thread = std::move(main_thread)]() mutable {
-      main_thread->Wait(0, 0, 0, nullptr);
-      OnGuestThreadExit(main_thread.get());
-      REXLOG_INFO("Execution complete");
-      if (!shutting_down_.load(std::memory_order_acquire)) {
-        app_context().CallInUIThread([this]() { app_context().QuitFromUIThread(); });
-      }
-    });
+    // Drive the blocking init off the UI thread when an ImGui overlay is
+    // available so the user sees a "Compiling shaders X of Y" progress dialog
+    // while the D3D12 driver chews through the warmed-cache PSO list. Without
+    // this the window appears frozen for many seconds on cold launches with
+    // large caches (Downpour ROV path: ~hundreds of PSOs).
+    if (kBlockShaderStorageStartup && imgui_drawer_) {
+      auto cache_root = runtime_->cache_root();
+      // The dialog adds itself to imgui_drawer_'s dialog list in its ctor and
+      // Close()s itself once `finished` flips — ownership is the dialog list.
+      auto main_thread_shared =
+          std::make_shared<system::object_ref<system::XThread>>(std::move(main_thread));
+      new rex::ui::ShaderCompileDialog(
+          imgui_drawer_.get(), graphics_system, "Preparing shaders",
+          "Warming the D3D12 pipeline cache for the current render path. "
+          "This only runs in full once per cache; later launches are fast.",
+          [this, main_thread_shared]() mutable {
+            // Already on UI thread (dialog renders here).
+            FinishModuleLaunch(std::move(*main_thread_shared));
+          });
+
+      // Background worker: the SDK's blocking InitializeShaderStorage internally
+      // dispatches to the CP thread via a fence; the worker just sits on the
+      // fence so the UI thread keeps pumping frames + drawing the dialog.
+      std::thread([graphics_system, cache_root = std::move(cache_root), title_id]() {
+        graphics_system->InitializeShaderStorage(cache_root, title_id, true);
+      }).detach();
+      return;
+    }
+
+    // Headless / non-overlay fallback: keep the legacy direct blocking init.
+    graphics_system->InitializeShaderStorage(runtime_->cache_root(), title_id,
+                                             kBlockShaderStorageStartup);
+    FinishModuleLaunch(std::move(main_thread));
+  });
+}
+
+void ReXApp::FinishModuleLaunch(system::object_ref<system::XThread> main_thread) {
+  OnPostLaunchModule(main_thread.get());
+  main_thread->Resume();
+
+  module_thread_ = std::thread([this, main_thread = std::move(main_thread)]() mutable {
+    main_thread->Wait(0, 0, 0, nullptr);
+    OnGuestThreadExit(main_thread.get());
+    REXLOG_INFO("Execution complete");
+    if (!shutting_down_.load(std::memory_order_acquire)) {
+      app_context().CallInUIThread([this]() { app_context().QuitFromUIThread(); });
+    }
   });
 }
 

@@ -49,6 +49,17 @@ REXCVAR_DEFINE_STRING(render_target_path_d3d12, "", "GPU/D3D12",
 
 REXCVAR_DEFINE_BOOL(native_stencil_value_output, true, "GPU", "Enable native stencil value output");
 
+// Diagnostic: log every EDRAM ownership transfer queued by RenderTargetCache::Update.
+// Used to compare our transfer pattern against Xenia for the same scene and find
+// false-positive overlap-detected transfers that produce the chromatic-noise bug.
+REXCVAR_DEFINE_BOOL(log_ownership_transfers, false, "GPU/D3D12",
+                    "Log every EDRAM ownership transfer queued per draw (very verbose)");
+
+// Note 2026-06-20: previously cvar `apply_dp1_7e3_to_8888_saturating_mov` toggled
+// this branch globally. Replaced with auto-gating on TransferShaderKey::pitches_match
+// so foliage/alpha-test (pitch-matched) gets saturation, bathroom pitch-mismatched
+// transfer gets bit-preservation. No user cvar needed.
+
 namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
@@ -1075,6 +1086,40 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
     case Path::kHostRenderTargets: {
       RenderTarget* const* depth_and_color_render_targets =
           last_update_accumulated_render_targets();
+      if (REXCVAR_GET(log_ownership_transfers)) {
+        static std::atomic<uint64_t> s_draw_index{0};
+        const uint64_t draw_idx = s_draw_index.fetch_add(1, std::memory_order_relaxed);
+        const std::vector<Transfer>* transfers = last_update_transfers();
+        for (uint32_t rt = 0; rt < 1 + xenos::kMaxColorRenderTargets; ++rt) {
+          for (const Transfer& xfer : transfers[rt]) {
+            const RenderTargetKey dst_key =
+                depth_and_color_render_targets[rt] ? depth_and_color_render_targets[rt]->key()
+                                                   : RenderTargetKey();
+            const RenderTargetKey src_key = xfer.source ? xfer.source->key() : RenderTargetKey();
+            const RenderTargetKey hds_key =
+                xfer.host_depth_source ? xfer.host_depth_source->key() : RenderTargetKey();
+            const uint32_t src_bpp = src_key.IsEmpty() ? 0u : (src_key.Is64bpp() ? 64u : 32u);
+            const uint32_t dst_bpp = dst_key.IsEmpty() ? 0u : (dst_key.Is64bpp() ? 64u : 32u);
+            REXGPU_INFO(
+                "[xfer] draw={} rt={} tiles=[{}..{}] | "
+                "src: kind={} fmt={}({}) base={}t pitch={}t msaa={}x bpp={} | "
+                "dst: kind={} fmt={}({}) base={}t pitch={}t msaa={}x bpp={}{}{}",
+                draw_idx, rt, xfer.start_tiles, xfer.end_tiles,
+                src_key.IsEmpty() ? "EMPTY" : (src_key.is_depth ? "depth" : "color"),
+                src_key.IsEmpty() ? "-" : src_key.GetFormatName(),
+                uint32_t(src_key.resource_format),
+                uint32_t(src_key.base_tiles), src_key.GetPitchTiles(),
+                uint32_t(1) << uint32_t(src_key.msaa_samples), src_bpp,
+                dst_key.IsEmpty() ? "EMPTY" : (dst_key.is_depth ? "depth" : "color"),
+                dst_key.IsEmpty() ? "-" : dst_key.GetFormatName(),
+                uint32_t(dst_key.resource_format),
+                uint32_t(dst_key.base_tiles), dst_key.GetPitchTiles(),
+                uint32_t(1) << uint32_t(dst_key.msaa_samples), dst_bpp,
+                xfer.host_depth_source ? " | hds: fmt=" : "",
+                xfer.host_depth_source ? hds_key.GetFormatName() : "");
+          }
+        }
+      }
       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
                                        depth_and_color_render_targets, last_update_transfers());
       SetCommandListRenderTargets(depth_and_color_render_targets);
@@ -1944,6 +1989,15 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   xenos::DepthRenderTargetFormat dest_depth_format =
       xenos::DepthRenderTargetFormat(key.dest_resource_format);
   bool dest_is_64bpp = dest_is_color && xenos::IsColorRenderTargetFormat64bpp(dest_color_format);
+  // Upstream xenia 2912da02f: gamma stored as R16G16B16A16_UNORM is 64bpp host
+  // storage but 32bpp coordinate addressing. Without separating this from true
+  // 64bpp formats, the transfer pixel shader's coordinate math addresses the
+  // wrong source pixels and the output is corrupt (chromatic noise on Murphy's
+  // face in Silent Hill: Downpour was traced to exactly this on RTV path).
+  bool dest_is_gamma_unorm16 =
+      dest_is_color &&
+      dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA &&
+      gamma_render_target_as_unorm16_;
 
   xenos::ColorRenderTargetFormat source_color_format =
       xenos::ColorRenderTargetFormat(key.source_resource_format);
@@ -3041,7 +3095,7 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
     a.OpMov(dxbc::Dest::OStencilRef(), dxbc::Src::R(1, dxbc::Src::kXXXX));
   }
 
-  if (dest_is_64bpp) {
+  if (dest_is_64bpp || dest_is_gamma_unorm16) {
     // Handle construction of 64bpp color, either from two 32-bit samples in r0
     // and r1, or from one 64bpp sample in r1. Using r2.x as temporary when
     // needed.
@@ -3053,6 +3107,10 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
         case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA: {
           // 8_8_8_8_GAMMA is represented by linear stored in
           // R16G16B16A16_UNORM.
+          if (dest_is_gamma_unorm16) {
+            a.OpMov(dxbc::Dest::O(0), dxbc::Src::R(1));
+            break;
+          }
           for (uint32_t i = 0; i < 2; ++i) {
             for (uint32_t j = 0; j < 3; ++j) {
               DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(a, i, j, i, j, 2, 0, 2, 1);
@@ -3061,6 +3119,14 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
         }
           [[fallthrough]];
         case xenos::ColorRenderTargetFormat::k_8_8_8_8: {
+          if (dest_is_gamma_unorm16) {
+            // Convert gamma-encoded source to linear for gamma_unorm16 dest.
+            for (uint32_t j = 0; j < 3; ++j) {
+              DxbcShaderTranslator::PWLGammaToLinear(a, 1, j, 1, j, true, 2, 0, 2, 1);
+            }
+            a.OpMov(dxbc::Dest::O(0), dxbc::Src::R(1));
+            break;
+          }
           color_packed_in_r0x_and_r1x = true;
           for (uint32_t i = 0; i < 2; ++i) {
             a.OpMAd(dxbc::Dest::R(i), dxbc::Src::R(i), dxbc::Src::LF(255.0f), dxbc::Src::LF(0.5f));
@@ -3175,6 +3241,74 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
       if (dest_color_format == xenos::ColorRenderTargetFormat::k_32_32_FLOAT) {
         a.OpMov(dxbc::Dest::O(0, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX));
         a.OpMov(dxbc::Dest::O(0, 0b0010), dxbc::Src::R(1, dxbc::Src::kXXXX));
+      } else if (dest_is_gamma_unorm16) {
+        // For gamma_unorm16, only r1.x has a valid packed 32-bit EDRAM dword
+        // (one pixel, since gamma_unorm16 is 32bpp Xenos / 64bpp host).
+        // Reinterpret as k_8_8_8_8_GAMMA (4 gamma-encoded bytes) and convert
+        // to linear float for R16G16B16A16_UNORM output.
+        //
+        // Use midpoint encoding to survive the UNORM16 quantization round-trip
+        // through PreSaturatedLinearToPWLGamma (which uses trunc()). Storing
+        // the exact PWLGammaToLinear result puts values at the lower boundary
+        // of the valid range, where UNORM16 quantization can push them below
+        // threshold causing +/-1 byte errors that corrupt cross-format EDRAM
+        // reinterpretation.
+        //
+        // For gamma byte B, the midpoint linear value is:
+        //   Piece 0 (B < 64):    F = (B + 0.5) / 1023.0
+        //   Piece 1 (64<=B<96):  F = (B - 31.5) / 511.5
+        //   Piece 2 (96<=B<192): F = (B - 63.5) / 255.75
+        //   Piece 3 (B >= 192):  F = (B - 127.5) / 127.875
+        // Using MAd form: F = B * recip + offset.
+
+        // Extract 4 bytes: r1.xyzw = [R, G, B, A] as uint.
+        a.OpUBFE(dxbc::Dest::R(1), dxbc::Src::LU(8, 8, 8, 8),
+                 dxbc::Src::LU(0, 8, 16, 24), dxbc::Src::R(1, dxbc::Src::kXXXX));
+
+        // Alpha: o0.w = float(A) / 255.0 (no gamma conversion).
+        a.OpUToF(dxbc::Dest::R(0, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW));
+        a.OpMul(dxbc::Dest::O(0, 0b1000), dxbc::Src::R(0, dxbc::Src::kWWWW),
+                dxbc::Src::LF(1.0f / 255.0f));
+
+        // RGB: per-channel midpoint encoding using r0.xy as (recip, offset)
+        // and r2.x as comparison temp.
+        for (uint32_t j = 0; j < 3; ++j) {
+          // Default to piece 0.
+          a.OpMov(dxbc::Dest::R(0, 0b0001), dxbc::Src::LF(1.0f / 1023.0f));
+          a.OpMov(dxbc::Dest::R(0, 0b0010), dxbc::Src::LF(0.5f / 1023.0f));
+          // Piece 1: byte >= 64.
+          a.OpUGE(dxbc::Dest::R(2, 0b0001), dxbc::Src::R(1).Select(j),
+                  dxbc::Src::LU(64));
+          a.OpMovC(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(2, dxbc::Src::kXXXX),
+                   dxbc::Src::LF(1.0f / 511.5f),
+                   dxbc::Src::R(0, dxbc::Src::kXXXX));
+          a.OpMovC(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(2, dxbc::Src::kXXXX),
+                   dxbc::Src::LF(-31.5f / 511.5f),
+                   dxbc::Src::R(0, dxbc::Src::kYYYY));
+          // Piece 2: byte >= 96.
+          a.OpUGE(dxbc::Dest::R(2, 0b0001), dxbc::Src::R(1).Select(j),
+                  dxbc::Src::LU(96));
+          a.OpMovC(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(2, dxbc::Src::kXXXX),
+                   dxbc::Src::LF(1.0f / 255.75f),
+                   dxbc::Src::R(0, dxbc::Src::kXXXX));
+          a.OpMovC(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(2, dxbc::Src::kXXXX),
+                   dxbc::Src::LF(-63.5f / 255.75f),
+                   dxbc::Src::R(0, dxbc::Src::kYYYY));
+          // Piece 3: byte >= 192.
+          a.OpUGE(dxbc::Dest::R(2, 0b0001), dxbc::Src::R(1).Select(j),
+                  dxbc::Src::LU(192));
+          a.OpMovC(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(2, dxbc::Src::kXXXX),
+                   dxbc::Src::LF(1.0f / 127.875f),
+                   dxbc::Src::R(0, dxbc::Src::kXXXX));
+          a.OpMovC(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(2, dxbc::Src::kXXXX),
+                   dxbc::Src::LF(-127.5f / 127.875f),
+                   dxbc::Src::R(0, dxbc::Src::kYYYY));
+          // F = float(byte) * recip + offset.
+          a.OpUToF(dxbc::Dest::R(2, 0b0001), dxbc::Src::R(1).Select(j));
+          a.OpMAd(dxbc::Dest::O(0, 1 << j), dxbc::Src::R(2, dxbc::Src::kXXXX),
+                  dxbc::Src::R(0, dxbc::Src::kXXXX),
+                  dxbc::Src::R(0, dxbc::Src::kYYYY));
+        }
       } else {
         for (uint32_t i = 0; i < 2; ++i) {
           a.OpUBFE(dxbc::Dest::O(0, 0b11 << (i * 2)), dxbc::Src::LU(16),
@@ -3290,15 +3424,21 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
           } else if (dest_is_color &&
                      (dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
                       dest_color_format ==
-                          xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA)) {
+                          xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) &&
+                     key.pitches_match) {
             // DP1 fix: HDR (7e3) -> 8888 ownership transfer with value-clipping
             // instead of bit-preservation. Without this, the raw 7e3 bits get
             // unpacked as UNORM8 garbage, which then leaks through subsequent
             // tonemap+alpha-blend passes wherever src.a == 0 (alpha-tested hair,
-            // foliage, statue billboards in Deadly Premonition), producing the
-            // visible rainbow speckles. Saturating HDR floats to [0, 1] and
-            // writing them directly as UNORM8 leaves clipped-HDR-looking
-            // residue at alpha-test pixels instead of rainbow noise.
+            // foliage, statue billboards in Deadly Premonition and Downpour
+            // outdoor grass), producing the visible rainbow speckles.
+            //
+            // Smart-gated 2026-06-20: only apply when source and dest EDRAM
+            // pitches match. The Downpour Pleasant River bathroom Pass #12
+            // EID 6008 transfer has source<16t> -> dest<8t> pitch MISMATCH and
+            // needs bit-preservation instead (saturate would produce cyan/
+            // magenta checkerboard). Pitch-matched transfers are the typical
+            // foliage/alpha-test case that benefits from value-clipping.
             a.OpMov(dxbc::Dest::O(0), dxbc::Src::R(1), true);
           } else {
             color_packed_in_r1x = true;
@@ -4363,6 +4503,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           RenderTargetKey source_rt_key = source_d3d12_rt.key();
           new_transfer_shader_key.source_msaa_samples = source_rt_key.msaa_samples;
           new_transfer_shader_key.source_resource_format = source_rt_key.resource_format;
+          new_transfer_shader_key.pitches_match =
+              (source_rt_key.GetPitchTiles() == dest_pitch_tiles) ? 1 : 0;
           bool host_depth_source_is_copy = host_depth_source_d3d12_rt == &dest_d3d12_rt;
           new_transfer_shader_key.host_depth_source_is_copy = host_depth_source_is_copy;
           // The host depth copy buffer has only raw samples.

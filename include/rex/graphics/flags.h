@@ -126,4 +126,5 @@ REXCVAR_DECLARE(std::string, render_target_path_d3d12);
 REXCVAR_DECLARE(bool, d3d12_readback_memexport);
 REXCVAR_DECLARE(bool, d3d12_readback_resolve);
 
+
 #define XE_GPU_FINE_GRAINED_DRAW_SCOPES 1

@@ -35,6 +35,7 @@
 #include <rex/graphics/d3d12/pipeline_cache.h>
 #include <rex/graphics/d3d12/render_target_cache.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/graphics_system.h>
 #include <rex/graphics/format/dxbc.h>
 #include <rex/graphics/pipeline_util.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
@@ -223,6 +224,16 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
                                             uint32_t title_id, bool blocking) {
   ShutdownShaderStorage();
 
+  // Progress reporting for the launch-time compile overlay. Reset to zero,
+  // mark in-progress; the dialog is already running on the UI thread and
+  // polling these atomics while we work here on the CP thread.
+  auto& progress = command_processor_.graphics_system()->shader_storage_progress();
+  progress.shaders_translated.store(0, std::memory_order_relaxed);
+  progress.pipelines_created.store(0, std::memory_order_relaxed);
+  progress.pipelines_total.store(0, std::memory_order_relaxed);
+  progress.finished.store(false, std::memory_order_relaxed);
+  progress.in_progress.store(true, std::memory_order_release);
+
   auto shader_storage_root = cache_root / "shaders";
   // For files that can be moved between different hosts.
   // Host PSO blobs - if ever added - should be stored in shaders/local/ (they
@@ -299,6 +310,10 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
           fread(pipeline_stored_descriptions.data(), sizeof(PipelineStoredDescription),
                 pipeline_storage_told_count, pipeline_storage_file_));
       size_t pipeline_storage_read_count = pipeline_stored_descriptions.size();
+      // Publish the upper-bound count to the launch overlay so the progress
+      // bar has a denominator before the first pipeline starts compiling.
+      progress.pipelines_total.store(uint32_t(pipeline_storage_read_count),
+                                     std::memory_order_release);
       for (size_t i = 0; i < pipeline_storage_read_count; ++i) {
         const PipelineStoredDescription& pipeline_stored_description =
             pipeline_stored_descriptions[i];
@@ -499,6 +514,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
       }
       shaders_translation_thread_cond.notify_one();
       ++shaders_translated;
+      progress.shaders_translated.fetch_add(1, std::memory_order_relaxed);
     }
     if (!shader_translation_threads.empty()) {
       {
@@ -655,8 +671,17 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
       } else {
         new_pipeline->state.store(CreateD3D12Pipeline(pipeline_runtime_description),
                                   std::memory_order_release);
+        if (progress.in_progress.load(std::memory_order_relaxed)) {
+          progress.pipelines_created.fetch_add(1, std::memory_order_relaxed);
+        }
       }
       ++pipelines_created;
+      // Note: progress.pipelines_created is bumped from the actual compile
+      // sites (CreationThread / CreateQueuedPipelinesOnProcessorThread / the
+      // inline single-threaded branch above) so the overlay reflects driver
+      // completion, not queue submission. Bumping here instead would saturate
+      // the progress bar in <1s and then sit at 100% while the real work
+      // continues for many seconds.
     }
 
     if (!creation_threads_.empty()) {
@@ -725,6 +750,12 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
   storage_write_thread_ = rex::thread::Thread::Create({}, [this]() { StorageWriteThread(); });
   assert_not_null(storage_write_thread_);
   storage_write_thread_->set_name("D3D12 Storage writer");
+
+  // Drop the overlay. `finished` flips before `in_progress` so the dialog's
+  // poll loop sees a consistent "done -> hide" transition even if it samples
+  // between the two stores.
+  progress.finished.store(true, std::memory_order_release);
+  progress.in_progress.store(false, std::memory_order_release);
 }
 
 void PipelineCache::ShutdownShaderStorage() {
@@ -3241,6 +3272,14 @@ void PipelineCache::CreationThread(size_t thread_index) {
       pipeline_to_create->state.store(CreateD3D12Pipeline(runtime_description),
                                       std::memory_order_release);
     }
+    {
+      // Progress bump is gated by the storage-init flag so runtime pipeline
+      // creation (post-launch) doesn't bump the launch overlay's counters.
+      auto& progress = command_processor_.graphics_system()->shader_storage_progress();
+      if (progress.in_progress.load(std::memory_order_relaxed)) {
+        progress.pipelines_created.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
 
     // Pipeline created - the thread is not busy anymore, safe to set the
     // completion event if needed (at the next iteration, or in some other
@@ -3254,6 +3293,8 @@ void PipelineCache::CreationThread(size_t thread_index) {
 
 void PipelineCache::CreateQueuedPipelinesOnProcessorThread() {
   assert_false(creation_threads_.empty());
+  auto& progress = command_processor_.graphics_system()->shader_storage_progress();
+  const bool tracking = progress.in_progress.load(std::memory_order_relaxed);
   while (true) {
     Pipeline* pipeline_to_create;
     {
@@ -3271,6 +3312,9 @@ void PipelineCache::CreateQueuedPipelinesOnProcessorThread() {
     }
     pipeline_to_create->state.store(CreateD3D12Pipeline(runtime_description),
                                     std::memory_order_release);
+    if (tracking) {
+      progress.pipelines_created.fetch_add(1, std::memory_order_relaxed);
+    }
   }
 }
 

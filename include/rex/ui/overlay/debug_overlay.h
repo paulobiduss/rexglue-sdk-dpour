@@ -35,6 +35,9 @@ class DebugOverlayDialog : public ImGuiDialog {
 
   void SetStatsProvider(FrameStatsProvider provider) { stats_provider_ = std::move(provider); }
 
+  // Passive readout — keyboard toggles handled at app level, no in-dialog input.
+  bool WantsInputCapture() const override { return false; }
+
  protected:
   void OnDraw(ImGuiIO& io) override;
 

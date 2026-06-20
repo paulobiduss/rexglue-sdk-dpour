@@ -44,6 +44,13 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
 
   ImGuiIO& GetIO();
   bool HasDialogs() const { return !dialogs_.empty(); }
+  // Returns true if any currently-open dialog reports WantsInputCapture() == true.
+  // Used by the input-system "is_active" callback to release MnK mouse capture
+  // (un-hide the cursor, stop CenterCursor) whenever an interactive dialog is
+  // on screen. Relying on ImGuiIO::WantCaptureMouse alone fails because MnK's
+  // per-frame CenterCursor prevents the cursor from ever landing on a dialog,
+  // so ImGui's hover check never fires.
+  bool HasInputCapturingDialog() const;
 
   void AddDialog(ImGuiDialog* dialog);
   void RemoveDialog(ImGuiDialog* dialog);

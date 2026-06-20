@@ -23,6 +23,8 @@
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/thread_state.h>
 
+#include <unordered_set>
+
 namespace rex::runtime {
 
 namespace {
@@ -35,8 +37,14 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
 }  // namespace
 
 static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
-  REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
-            ctx.last_indirect_target);
+  // Was REX_FATAL; relaxed to ERROR-and-return to allow harvest of all missing
+  // function addresses in a single run for batch fixing.
+  static thread_local std::unordered_set<uint32_t> warned;
+  uint32_t addr = ctx.last_indirect_target;
+  if (warned.insert(addr).second) {
+    REXLOG_ERROR("Unregistered guest function call: 0x{:08X}", addr);
+  }
+  // Return to caller; context unchanged, r3 is whatever it was.
 }
 
 PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {

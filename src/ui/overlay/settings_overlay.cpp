@@ -157,9 +157,12 @@ static rex::ui::VirtualKey ImGuiKeyToVirtualKey(ImGuiKey key) {
 void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
   auto& registry = rex::cvar::GetRegistry();
 
-  // Collect sorted unique category paths.
+  // Collect sorted unique category paths. Skip Skate3-specific knobs that
+  // the skate3 fork registers at SDK level — they're irrelevant in any other
+  // game built on this fork (e.g. Downpour).
   std::set<std::string> category_set;
   for (auto& entry : registry) {
+    if (entry.category.rfind("Skate 3", 0) == 0) continue;
     category_set.insert(entry.category);
   }
 
@@ -289,6 +292,8 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
 
   ImGui::BeginChild("##cvars", ImVec2(0, -30.0f), false);
   for (auto& entry : registry) {
+    // Hide Skate3-specific cvars in non-Skate3 builds (see top of OnDraw).
+    if (entry.category.rfind("Skate 3", 0) == 0) continue;
     // Filter by category (unless searching).
     if (!searching) {
       if (!category_matches(entry.category)) {
@@ -498,13 +503,55 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
   }
   ImGui::EndChild();
 
-  // Bottom bar: Save button.
+  // Bottom bar: Save button + explicit confirmation modal.
   ImGui::Separator();
   if (ImGui::Button("Save to config")) {
-    rex::cvar::SaveConfig(config_path_);
+    save_confirm_open_ = true;
+    ImGui::OpenPopup("Save to config?");
   }
   ImGui::SameLine();
   ImGui::TextDisabled("(%s)", config_path_.filename().string().c_str());
+  if (!save_status_.empty()) {
+    if (ImGui::GetTime() < save_status_until_) {
+      ImGui::SameLine();
+      ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "%s", save_status_.c_str());
+    } else {
+      save_status_.clear();
+    }
+  }
+
+  if (save_confirm_open_) {
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing,
+                            ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal("Save to config?", &save_confirm_open_,
+                               ImGuiWindowFlags_AlwaysAutoResize |
+                                   ImGuiWindowFlags_NoSavedSettings)) {
+      ImGui::TextWrapped("This will rewrite %s on disk.", config_path_.filename().string().c_str());
+      ImGui::Spacing();
+      ImGui::TextWrapped(
+          "A backup will be written as %s.backup before the file is replaced.",
+          config_path_.filename().string().c_str());
+      ImGui::Spacing();
+      ImGui::TextDisabled(
+          "Tip: the on-disk file is also modified by the launcher and other code "
+          "paths; pressing this button overwrites cvars that aren't at their "
+          "default value while preserving unrecognised keys.");
+      ImGui::Separator();
+      if (ImGui::Button("Confirm save", ImVec2(160.0f, 32.0f))) {
+        rex::cvar::SaveConfig(config_path_);
+        save_status_ = "Saved.";
+        save_status_until_ = ImGui::GetTime() + 3.0;
+        save_confirm_open_ = false;
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Cancel", ImVec2(120.0f, 32.0f))) {
+        save_confirm_open_ = false;
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::EndPopup();
+    }
+  }
 
   ImGui::End();
 }

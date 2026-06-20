@@ -30,6 +30,13 @@ class SettingsDialog : public ImGuiDialog {
   char search_buf_[128] = {};
   std::string selected_category_;
   std::string capturing_bind_name_;
+  // Save-button state machine. Button click → kConfirmPending opens an
+  // explicit ImGui modal so the user has to confirm before the on-disk TOML
+  // is rewritten. Earlier behavior wrote on bare click and silently dropped
+  // unrecognised TOML entries — see `reference_sdk_saveconfig_wipes_toml.md`.
+  bool save_confirm_open_ = false;
+  std::string save_status_;
+  double save_status_until_ = 0.0;
 };
 
 }  // namespace rex::ui

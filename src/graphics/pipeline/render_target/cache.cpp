@@ -41,6 +41,28 @@ REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
                     "Resolve from host render targets directly to shared memory when possible")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Hybrid RTV-path fix for Silent Hill: Downpour HDR scene RT corruption.
+// 2026-06-19 NIGHT RenderDoc forensic localized the bug to ownership transfer
+// from a kD24FS8 4xMSAA depth RT into the k_2_10_10_10_FLOAT 1xMSAA HDR scene
+// RT (UE3 G-buffer EDRAM aliasing pattern). The transfer pixel shader treats
+// depth bits as 7e3 floats and decodes them via Float7e3To32, producing wildly
+// out-of-range HDR values (Tex Before = (0.013, 0.012, 0.008, 0.333) ->
+// Tex After = (8.1875, 0.25, 0.8125, 0.333)) which then propagate through
+// resolve -> shared memory -> texture_load -> gamma -> composite as the
+// visible chromatic noise on Murphy. Xenia avoids this with persistent host
+// RT + aliased SRV views (no transfer at all on this pattern).
+//
+// This cvar skips ONLY the depth -> 7e3 direction. An earlier symmetric
+// variant (catching both depth<->7e3 directions) broke Downpour menu screens
+// because legitimate font rendering uses 7e3 -> depth reinterpretation.
+// Safe default is false. Enable for affected UE3 titles only.
+REXCVAR_DEFINE_BOOL(skip_depth_color_7e3_aliasing_transfers, false, "GPU",
+                    "Skip depth -> k_2_10_10_10_FLOAT ownership transfers (UE3 "
+                    "G-buffer aliasing workaround for the RTV EDRAM path - "
+                    "prevents Downpour HDR scene RT chromatic noise; one direction "
+                    "only to preserve menu font rendering)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics {
 
 void RenderTargetCache::GetPSIColorFormatInfo(xenos::ColorRenderTargetFormat format,
@@ -1332,7 +1354,35 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
         // Only perform the copying when actually changing the latest owner, not
         // just the latest host depth owner - the transfer source is expected to
         // be different than the destination.
-        if (!transfer_source.IsEmpty() && transfer_source != dest) {
+        // Hybrid-RTV noise workaround: when enabled, skip the depth -> 7e3
+        // (k_2_10_10_10_FLOAT) format-converting ownership transfer. See cvar
+        // comment above for the RenderDoc forensic that localized this to
+        // depth bits being decoded as Float7e3To32 inside the transfer pixel
+        // shader. One direction only to preserve menu font rendering.
+        //
+        // Known limitation (TODO v0.1.3): depth -> k_8_8_8_8 ownership transfer
+        // with MSAA mismatch (e.g. bathroom / Pleasant River body scene,
+        // 4xMSAA kD24FS8 -> 1xMSAA k_8_8_8_8 at base 1624t per the 2026-06-19
+        // RenderDoc EID 6025 capture) produces cyan/magenta posterized stripes
+        // because depth bits are dumped as UNORM8 bytes. Extending this skip
+        // to cover depth -> 8888 at any MSAA pairing breaks menu font
+        // rendering (autosave warning, difficulty selection) - the menu's
+        // downstream color -> color transfer at base 720t pitch 16t -> 13t
+        // ends up sourcing stale content from the not-overwritten 8888 RT
+        // and replicates text as multiple offset ghosts. Need a shader-level
+        // value-clip path (analogous to the 7e3 -> 8888 fix in
+        // src/graphics/d3d12/render_target_cache.cpp:3431) or a tile-base
+        // specific filter, neither implemented yet.
+        bool skip_for_aliasing = false;
+        if (REXCVAR_GET(skip_depth_color_7e3_aliasing_transfers) &&
+            transfer_source.is_depth && !dest.is_depth) {
+          xenos::ColorRenderTargetFormat color_fmt = dest.GetColorFormat();
+          skip_for_aliasing =
+              color_fmt == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+              color_fmt == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16;
+        }
+
+        if (!transfer_source.IsEmpty() && transfer_source != dest && !skip_for_aliasing) {
           uint32_t transfer_end_tiles = std::min(it->second.end_tiles, extent_end);
           if (!resolve_clear_cutout ||
               Transfer::GetRangeRectangles(it->first, transfer_end_tiles, dest.base_tiles,

@@ -190,6 +190,12 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// PrepareModuleLaunch, main thread resume, background wait.
   virtual void LaunchModule();
 
+  /// Resume the prepared guest main thread and start the background wait
+  /// loop. Split out from LaunchModule so the shader-compile overlay can call
+  /// it as its on-complete callback (the overlay defers resume until cached
+  /// PSOs are warmed). MUST run on the UI thread.
+  void FinishModuleLaunch(system::object_ref<system::XThread> main_thread);
+
   // --- Accessors for subclass use ---
   Runtime* runtime() const { return runtime_.get(); }
   ui::Window* window() const { return window_.get(); }

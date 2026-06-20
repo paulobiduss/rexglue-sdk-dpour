@@ -31,6 +31,19 @@ REXCVAR_DEFINE_BOOL(half_pixel_offset, true, "GPU", "Enable half pixel offset");
 REXCVAR_DEFINE_BOOL(resolve_resolution_scale_fill_half_pixel_offset, true, "GPU",
                     "Fill half pixel offset during resolution scale resolve");
 
+// Diagnostic: log every Resolve with source format / base_tiles / pitch / msaa
+// + RB_COLOR_INFO raw register value. Used to confirm whether game writes 7e3
+// (HDR) RT format at the time of resolves; bug hypothesis is that our SDK reads
+// format=0 (k_8_8_8_8) when game intended k_2_10_10_10_FLOAT.
+REXCVAR_DEFINE_BOOL(log_resolves, false, "GPU/D3D12",
+                    "Log every Resolve with full format / EDRAM info (diagnostic).");
+
+// ============================================================================
+// Downpour Test category — reserved for future Downpour-specific diagnostics.
+// (Previous exploratory cvars removed 2026-06-19 NIGHT after the actual fix
+// landed via `skip_depth_color_7e3_aliasing_transfers` in GPU category.)
+// ============================================================================
+
 // Very prominent in 545407F2.
 // DEFINE_bool(
 //     resolve_resolution_scale_fill_half_pixel_offset, true,
@@ -1107,6 +1120,75 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
                : xenos::GetColorRenderTargetFormatName(
                      xenos::ColorRenderTargetFormat(color_edram_info.format)),
       dest_format_info.name, rb_copy_dest_base, copy_dest_extent_start, copy_dest_extent_end);
+
+  if (REXCVAR_GET(log_resolves)) {
+    // Extended diagnostic for the resolve-copy 7e3->8888 bug hypothesis.
+    // Logs both EDRAM source format (RB_COLOR_INFO derived) AND the destination
+    // pack format / endian / swap / exp_bias / shader-path prediction so we
+    // can confirm the exact bad pair is source=7e3, dest=8888-family,
+    // shader=Full32bpp before committing to a fix.
+    if (is_depth) {
+      REXGPU_INFO(
+          "[resolve] depth: src=depth fmt={} base={}t pitch={}t msaa={}x  "
+          "dest_fmt={} dest_base=0x{:08X}",
+          xenos::GetDepthRenderTargetFormatName(
+              xenos::DepthRenderTargetFormat(depth_edram_info.format)),
+          uint32_t(depth_edram_info.base_tiles),
+          uint32_t(depth_edram_info.pitch_tiles),
+          uint32_t(1) << uint32_t(depth_edram_info.msaa_samples),
+          dest_format_info.name, rb_copy_dest_base);
+    } else {
+      auto color_info_for_log = regs.Get<reg::RB_COLOR_INFO>(
+          reg::RB_COLOR_INFO::rt_register_indices[rb_copy_control.copy_src_select]);
+      bool bitwise_equiv = xenos::IsColorResolveFormatBitwiseEquivalent(
+          xenos::ColorRenderTargetFormat(color_edram_info.format),
+          xenos::ColorFormat(info_out.copy_dest_info.copy_dest_format));
+      bool single_sample = xenos::IsSingleCopySampleSelected(
+          info_out.copy_dest_coordinate_info.copy_sample_select);
+      bool takes_fast_path =
+          bitwise_equiv && single_sample && !info_out.copy_dest_info.copy_dest_exp_bias;
+      uint32_t bpp = dest_format_info.bits_per_pixel;
+      const char* shader_bucket;
+      if (takes_fast_path) {
+        if (uint32_t(color_edram_info.msaa_samples) >=
+            uint32_t(xenos::MsaaSamples::k4X)) {
+          shader_bucket = color_edram_info.format_is_64bpp ? "Fast64bpp4xMSAA"
+                                                           : "Fast32bpp4xMSAA";
+        } else {
+          shader_bucket = color_edram_info.format_is_64bpp ? "Fast64bpp1x2xMSAA"
+                                                           : "Fast32bpp1x2xMSAA";
+        }
+      } else {
+        switch (bpp) {
+          case 8:   shader_bucket = "Full8bpp";   break;
+          case 16:  shader_bucket = "Full16bpp";  break;
+          case 32:  shader_bucket = "Full32bpp";  break;
+          case 64:  shader_bucket = "Full64bpp";  break;
+          case 128: shader_bucket = "Full128bpp"; break;
+          default:  shader_bucket = "Full?";      break;
+        }
+      }
+      REXGPU_INFO(
+          "[resolve] color: rt={} RB_COLOR_INFO=0x{:08X} src={}({}) base={}t pitch={}t "
+          "msaa={}x is_64bpp={} | dest: fmt={}({}) bpp={} endian={} swap={} exp_bias={} "
+          "| path: bitwise_eq={} single_sample={} -> {} | dest_base=0x{:08X}",
+          uint32_t(rb_copy_control.copy_src_select), color_info_for_log.value,
+          xenos::GetColorRenderTargetFormatName(
+              xenos::ColorRenderTargetFormat(color_edram_info.format)),
+          uint32_t(color_edram_info.format),
+          uint32_t(color_edram_info.base_tiles),
+          uint32_t(color_edram_info.pitch_tiles),
+          uint32_t(1) << uint32_t(color_edram_info.msaa_samples),
+          uint32_t(color_edram_info.format_is_64bpp),
+          dest_format_info.name,
+          uint32_t(info_out.copy_dest_info.copy_dest_format), bpp,
+          uint32_t(info_out.copy_dest_info.copy_dest_endian),
+          uint32_t(info_out.copy_dest_info.copy_dest_swap),
+          int32_t(info_out.copy_dest_info.copy_dest_exp_bias),
+          uint32_t(bitwise_equiv), uint32_t(single_sample),
+          shader_bucket, rb_copy_dest_base);
+    }
+  }
 
   return true;
 }

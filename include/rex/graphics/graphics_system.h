@@ -83,6 +83,22 @@ class GraphicsSystem : public system::IGraphicsSystem {
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking);
 
+  // Snapshot of persistent-shader-storage initialization progress, polled by
+  // the launch-time compile-progress overlay so the user sees a progress bar
+  // instead of a frozen window during the multi-second PSO prewarm. All
+  // counters are also valid mid-frame from a non-CP thread.
+  struct ShaderStorageProgressCounters {
+    std::atomic<uint32_t> shaders_translated{0};
+    std::atomic<uint32_t> pipelines_created{0};
+    std::atomic<uint32_t> pipelines_total{0};
+    std::atomic<bool> in_progress{false};
+    std::atomic<bool> finished{false};
+  };
+  ShaderStorageProgressCounters& shader_storage_progress() { return shader_storage_progress_; }
+  const ShaderStorageProgressCounters& shader_storage_progress() const {
+    return shader_storage_progress_;
+  }
+
   void RequestFrameTrace();
   void BeginTracing();
   void EndTracing();
@@ -130,6 +146,8 @@ class GraphicsSystem : public system::IGraphicsSystem {
   std::unique_ptr<CommandProcessor> command_processor_;
 
   bool paused_ = false;
+
+  ShaderStorageProgressCounters shader_storage_progress_;
 
  private:
   std::unique_ptr<::rex::ui::Presenter> presenter_;

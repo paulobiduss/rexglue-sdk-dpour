@@ -57,6 +57,15 @@ ImGuiDrawer::~ImGuiDrawer() {
   }
 }
 
+bool ImGuiDrawer::HasInputCapturingDialog() const {
+  for (auto* dialog : dialogs_) {
+    if (dialog && dialog->WantsInputCapture()) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void ImGuiDrawer::AddDialog(ImGuiDialog* dialog) {
   assert_not_null(dialog);
   // Check if already added.

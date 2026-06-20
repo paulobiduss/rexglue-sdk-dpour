@@ -25,6 +25,8 @@ class FpsOverlayDialog : public ImGuiDialog {
       : ImGuiDialog(imgui_drawer), presenter_(presenter) {}
 
   bool WantsContinuousRepaint() const override { return false; }
+  // Passive readout, no mouse/keyboard interaction.
+  bool WantsInputCapture() const override { return false; }
 
  protected:
   void OnDraw(ImGuiIO& io) override;

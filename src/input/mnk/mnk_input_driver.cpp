@@ -30,8 +30,33 @@ REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller 
 REXCVAR_DEFINE_BOOL(mnk_capture_mouse, false, "Input",
                     "Capture and hide mouse cursor while MnK is active");
 REXCVAR_DEFINE_INT32(mnk_user_index, 0, "Input", "Controller slot (0-3) for MnK").range(0, 3);
-REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity for right stick")
+REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 0.6, "Input", "Mouse sensitivity for right stick")
     .range(0.01, 10.0);
+// How responsive the stick is to fresh mouse input. 0 = no smoothing (instant
+// response, can feel twitchy on integer-pixel WM_MOUSEMOVE); 0.95 = heavy
+// smoothing (silky but laggy). 0.15 is the new lower-lag default.
+REXCVAR_DEFINE_DOUBLE(mnk_smoothing, 0.15, "Input",
+                      "Mouse-to-stick EMA smoothing (0=no smoothing, 0.95=heavy)")
+    .range(0.0, 0.95);
+// Sub-linear curve: output ~ |delta|^exp * sign(delta). 1.0 = linear, 1.4 gives
+// finer precision at small movements and stronger response at large flicks
+// (acceleration-like feel without Windows ballistics interference).
+REXCVAR_DEFINE_DOUBLE(mnk_acceleration_exponent, 1.0, "Input",
+                      "Mouse acceleration curve exponent (1.0=linear, 1.5=precision boost)")
+    .range(0.5, 2.5);
+// How fast the stick decays back to 0 when the mouse stops. 0 = instant snap
+// to centre, 0.9 = long coast. 0.30 default eliminates the lingering drift the
+// older 0.5 default produced after a fast flick.
+REXCVAR_DEFINE_DOUBLE(mnk_decay, 0.30, "Input",
+                      "Stick decay rate when mouse stops (0=snap, 0.9=long coast)")
+    .range(0.0, 0.9);
+// Deadzone floor: smallest movement maps to this stick value, scaled up
+// linearly from 0 over an initial smooth ramp window. Lower = more direct
+// small-movement response; higher = quicker over-the-deadzone activation.
+REXCVAR_DEFINE_INT32(mnk_deadzone_compensation, 4000, "Input",
+                     "Stick deadzone compensation in int16 units (smooth ramp)")
+    .range(0, 16000);
+REXCVAR_DEFINE_BOOL(mnk_invert_y, false, "Input", "Invert mouse Y axis");
 
 REXCVAR_DEFINE_STRING(keybind_a, "Space", "Input/Keybinds/Controller", "A button");
 REXCVAR_DEFINE_STRING(keybind_b, "C", "Input/Keybinds/Controller", "B button");
@@ -285,44 +310,62 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
     ly -= INT16_MAX;
 
   double sensitivity = REXCVAR_GET(mnk_sensitivity);
-  constexpr double kBaseScale = 200.0;
-  double new_rx = static_cast<double>(mouse_dx_) * sensitivity * kBaseScale;
-  double new_ry = -static_cast<double>(mouse_dy_) * sensitivity * kBaseScale;
+  double smoothing = std::clamp(REXCVAR_GET(mnk_smoothing), 0.0, 0.95);
+  double accel_exp = std::clamp(REXCVAR_GET(mnk_acceleration_exponent), 0.5, 2.5);
+  double decay = std::clamp(REXCVAR_GET(mnk_decay), 0.0, 0.9);
+  double deadzone_floor = std::clamp(
+      static_cast<double>(REXCVAR_GET(mnk_deadzone_compensation)), 0.0, 16000.0);
+  bool invert_y = REXCVAR_GET(mnk_invert_y);
+  // Base scale tuned for sub-linear curve. Lower than the old 2500 because the
+  // pow(|dx|, exp) curve amplifies large flicks anyway, so sensitivity 0.6
+  // gives a comfortable PC-mouse feel that doesn't oversteer on small twitches.
+  constexpr double kBaseScale = 1500.0;
+  // Apply acceleration curve: sub-linear small movements (more precision),
+  // super-linear large movements (snappier turns).
+  auto curved = [&](int32_t dpx) {
+    if (dpx == 0) return 0.0;
+    double mag = std::pow(std::abs(static_cast<double>(dpx)), accel_exp);
+    return std::copysign(mag, static_cast<double>(dpx));
+  };
+  double new_rx = curved(mouse_dx_) * sensitivity * kBaseScale;
+  double new_ry = curved(mouse_dy_) * sensitivity * kBaseScale;
+  // Stick Y is up=positive, screen Y is down=positive, so invert by default.
+  // mnk_invert_y flips back to "down on mouse = look down on stick" feel.
+  new_ry = invert_y ? new_ry : -new_ry;
   mouse_dx_ = 0;
   mouse_dy_ = 0;
 
-  // Combine fresh mouse motion with the decaying virtual stick. This lets a
-  // brief flick of the mouse keep the simulated stick deflected for ~10-15
-  // polls (~160-250 ms at 60 Hz) so the camera can complete a full 360°
-  // sweep on a finite mouse pad. Without this, the stick re-centers the
-  // instant the mouse stops moving, and the user has to drag the mouse
-  // continuously to keep the camera turning.
+  // Mouse velocity → stick mapping with a one-pole low-pass filter.
+  // `smoothing` is the EMA carry-over alpha; lower = more responsive but more
+  // raw twitchy variance. Default 0.15 keeps ~2-3 ms perceived lag.
   constexpr double kInt16Max = 32767.0;
-  constexpr double kDecayPerPoll = 0.85;  // ~15% loss/poll, ~250 ms full decay at 60 Hz
-  if (new_rx != 0.0 && std::abs(new_rx) > std::abs(mouse_stick_x_)) {
-    mouse_stick_x_ = std::clamp(new_rx, -kInt16Max, kInt16Max);
-  } else {
-    mouse_stick_x_ *= kDecayPerPoll;
-    if (std::abs(mouse_stick_x_) < 1.0) mouse_stick_x_ = 0.0;
-  }
-  if (new_ry != 0.0 && std::abs(new_ry) > std::abs(mouse_stick_y_)) {
-    mouse_stick_y_ = std::clamp(new_ry, -kInt16Max, kInt16Max);
-  } else {
-    mouse_stick_y_ *= kDecayPerPoll;
-    if (std::abs(mouse_stick_y_) < 1.0) mouse_stick_y_ = 0.0;
-  }
+  auto update_stick_axis = [&](double new_v, double& stick) {
+    if (new_v != 0.0) {
+      double target = std::clamp(new_v, -kInt16Max, kInt16Max);
+      stick = stick * smoothing + target * (1.0 - smoothing);
+    } else {
+      stick *= decay;
+      if (std::abs(stick) < 1.0) stick = 0.0;
+    }
+  };
+  update_stick_axis(new_rx, mouse_stick_x_);
+  update_stick_axis(new_ry, mouse_stick_y_);
 
-  // Deadzone compensation. Many guests treat anything below
-  // XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE (8689) as "stick centered" and ignore
-  // it. Remap (0, INT16_MAX] -> [kDeadzoneFloor, INT16_MAX] so the smallest
-  // non-zero stick value already registers above the game's deadzone.
-  constexpr double kDeadzoneFloor = 9500.0;  // slightly above 8689
+  // Smooth-ramp deadzone compensation. The hard-jump from 0 to ~9500 in the
+  // old code was a major source of the "stick-not-mouse" feel: 1 stray pixel
+  // would catapult the stick a third of the way to max. Now we linearly ramp
+  // 0..kRampWindow into 0..deadzone_floor, then linearly to kInt16Max above.
+  constexpr double kRampWindow = 800.0;
   auto remap_axis = [&](double v) -> int32_t {
-    if (v == 0.0)
-      return 0;
-    double mag = std::abs(v);
-    double clamped = std::min(mag, kInt16Max);
-    double scaled = kDeadzoneFloor + clamped * (kInt16Max - kDeadzoneFloor) / kInt16Max;
+    if (v == 0.0) return 0;
+    double mag = std::min(std::abs(v), kInt16Max);
+    double scaled;
+    if (mag < kRampWindow) {
+      scaled = (mag / kRampWindow) * deadzone_floor;
+    } else {
+      double t = (mag - kRampWindow) / (kInt16Max - kRampWindow);
+      scaled = deadzone_floor + t * (kInt16Max - deadzone_floor);
+    }
     return static_cast<int32_t>(std::copysign(scaled, v));
   };
   int32_t rx = remap_axis(mouse_stick_x_);

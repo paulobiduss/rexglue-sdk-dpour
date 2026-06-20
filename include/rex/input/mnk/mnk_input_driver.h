@@ -81,10 +81,9 @@ class MnkInputDriver final : public InputDriver,
   // frame each. Lets the wheel be bound to any controller button.
   int32_t wheel_accumulator_y_ = 0;
 
-  // Right-stick virtual value that decays toward zero after mouse motion
-  // stops, so a brief flick of the mouse keeps the simulated stick deflected
-  // for a few polls. This is what lets the user spin the camera 360° with
-  // a finite mouse pad instead of having to drag continuously.
+  // Right-stick virtual value. Refreshed each poll by raw mouse motion
+  // (delta * sensitivity * scale), or decayed toward zero when the mouse is
+  // stationary so a brief flick still has a clean tail.
   double mouse_stick_x_ = 0.0;
   double mouse_stick_y_ = 0.0;
 

@@ -87,6 +87,8 @@ class CommandProcessor {
   CommandProcessor(GraphicsSystem* graphics_system, system::KernelState* kernel_state);
   virtual ~CommandProcessor();
 
+  GraphicsSystem* graphics_system() const { return graphics_system_; }
+
   uint32_t counter() const { return counter_; }
   void increment_counter() { counter_++; }
 

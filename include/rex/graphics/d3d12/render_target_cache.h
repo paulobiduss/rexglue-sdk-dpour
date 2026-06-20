@@ -392,6 +392,14 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
       // this is done only for the color source).
       uint32_t host_depth_source_is_copy : 1;
 
+      // 1 when source and dest EDRAM pitch tiles match (typical case: same-RT
+      // resolves and most format reinterpretations), 0 when they differ
+      // (cross-RT transfers like the Downpour Pleasant River bathroom Pass #12
+      // EID 6008 case: source<16t> -> dest<8t>). The 7e3 -> 8888 transfer
+      // codegen uses this to decide between value-clipping (DP1 alpha-test
+      // foliage fix) and bit-preserving paths.
+      uint32_t pitches_match : 1;
+
       // Last bits because this affects the root signature - after sorting, only
       // change it as fewer times as possible. Depth buffers have an additional
       // stencil SRV.

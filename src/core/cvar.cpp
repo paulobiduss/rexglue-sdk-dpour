@@ -627,14 +627,61 @@ bool IsFinalized() {
 void SaveConfig(const std::filesystem::path& config_path) {
   try {
     toml::table config;
+    bool existing_loaded = false;
 
+    // Step 1: try to parse the existing TOML so we MERGE into it rather than
+    // wipe it. The previous version constructed an empty table and only wrote
+    // cvars whose current runtime value != default — combined with TOML parse
+    // failure (e.g. duplicate keys written by a buggy external editor) that
+    // produced a chain reaction: parse fail -> LoadConfig left all cvars at
+    // default -> SaveConfig skipped all of them -> file truncated to 2-3
+    // surviving lines, losing the user's launcher-written graphics / mnk /
+    // keybind settings. See `reference_sdk_saveconfig_wipes_toml.md`.
+    if (std::filesystem::exists(config_path)) {
+      try {
+        config = toml::parse_file(config_path.string());
+        existing_loaded = true;
+      } catch (const toml::parse_error& err) {
+        // Refuse to overwrite a parse-broken TOML. The user's settings may
+        // be inside it; demand they fix the file or delete it manually.
+        REXLOG_ERROR(
+            "SaveConfig: existing TOML at {} has a parse error ({}); refusing to "
+            "overwrite. Fix the file or delete it to allow a fresh save.",
+            config_path.string(), err.what());
+        return;
+      }
+    }
+
+    // Step 2: backup the existing file before any modification. Cheap insurance
+    // — if anything goes wrong with the save (process crash mid-write, etc),
+    // the previous good state is still recoverable.
+    if (existing_loaded) {
+      std::filesystem::path backup_path = config_path;
+      backup_path += ".backup";
+      std::error_code ec;
+      std::filesystem::copy_file(config_path, backup_path,
+                                 std::filesystem::copy_options::overwrite_existing, ec);
+      if (ec) {
+        REXLOG_WARN("SaveConfig: backup {} failed: {} (continuing with save)",
+                    backup_path.string(), ec.message());
+      }
+    }
+
+    // Step 3: layer in non-default cvars. Existing keys not touched here stay
+    // as-is (preserves keybinds, unknown future cvars, comments would be lost
+    // by the toml++ writer but values are preserved).
     {
       std::lock_guard lock(GetRegistryMutex());
       for (const auto& entry : GetRegistryStorage()) {
-        if (entry.getter() == entry.default_value) {
+        if (entry.type == FlagType::Command) {
           continue;
         }
-
+        if (entry.getter() == entry.default_value) {
+          // Default-valued cvars are not written, but pre-existing values in
+          // the TOML are preserved (we merged into `config` above). This keeps
+          // saves lean without destroying user's previous edits.
+          continue;
+        }
         const std::string value = entry.getter();
         WriteConfigValue(config, entry, value);
       }
@@ -658,7 +705,25 @@ void SaveConfigValues(const std::filesystem::path& config_path,
   try {
     toml::table config;
     if (std::filesystem::exists(config_path)) {
-      config = toml::parse_file(config_path.string());
+      try {
+        config = toml::parse_file(config_path.string());
+      } catch (const toml::parse_error& err) {
+        REXLOG_ERROR(
+            "SaveConfigValues: existing TOML at {} has a parse error ({}); refusing to "
+            "overwrite. Fix the file or delete it to allow a fresh save.",
+            config_path.string(), err.what());
+        return;
+      }
+      // Backup the existing file before mutating — same insurance as SaveConfig.
+      std::filesystem::path backup_path = config_path;
+      backup_path += ".backup";
+      std::error_code ec;
+      std::filesystem::copy_file(config_path, backup_path,
+                                 std::filesystem::copy_options::overwrite_existing, ec);
+      if (ec) {
+        REXLOG_WARN("SaveConfigValues: backup {} failed: {} (continuing)",
+                    backup_path.string(), ec.message());
+      }
     }
 
     {
