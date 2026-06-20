@@ -36,7 +36,13 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 
-REXCVAR_DEFINE_BOOL(vsync, false, "GPU", "Enable vertical sync");
+// dpour-fork: default flipped to true. Downpour's 60 FPS lock depends on the
+// guest vblank thread pulsing at video_mode_refresh_rate (120 Hz) cadence
+// + the byte-reverted Xenia FPS-unlock patch capping at half-vblank. With
+// vsync=false the vblank uses the no_vsync 1000 Hz rate and the cap never
+// engages — observed 189 FPS uncapped, MnK decay tuning broken. See
+// `reference_downpour_fps_lock_triple.md`.
+REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, false, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
@@ -89,7 +95,11 @@ REXCVAR_DEFINE_INT32(scaled_resolve_small_texture_readback_max_length, 0x2D0000,
     .range(0, 16 * 1024 * 1024)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(readback_memexport, false, "GPU",
+// dpour-fork: default flipped to true. Downpour's UE3 font atlas uses Xenos
+// memexport to update glyph data each frame; without CPU readback all HUD /
+// subtitle / journal text renders as scrambled pixels. ~5-10% perf cost is
+// non-negotiable for the game to be playable.
+REXCVAR_DEFINE_BOOL(readback_memexport, true, "GPU",
                     "Enable CPU readback of shader memexport writes for guest memory "
                     "coherency (can reduce correctness issues, but may add GPU/CPU sync cost)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);

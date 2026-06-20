@@ -43,7 +43,12 @@
 REXCVAR_DEFINE_BOOL(native_stencil_value_output_d3d12_intel, false, "GPU/D3D12",
                     "Native stencil value output for Intel D3D12");
 
-REXCVAR_DEFINE_STRING(render_target_path_d3d12, "", "GPU/D3D12",
+// dpour-fork: default raised from "" (vendor auto) to "rov". Downpour's
+// runtime is ~2.5-3.5× faster on ROV due to heavy EDRAM tile recirculation
+// that RTV path has to barrier across. SDK auto-fallback at line 214+ still
+// kicks in if the GPU does not support ROV — older cards transparently land
+// on RTV. See `reference_downpour_perf_ceiling.md`.
+REXCVAR_DEFINE_STRING(render_target_path_d3d12, "rov", "GPU/D3D12",
                       "D3D12 render target implementation path")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 

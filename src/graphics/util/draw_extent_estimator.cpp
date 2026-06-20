@@ -24,7 +24,10 @@
 #include <rex/memory.h>
 #include <rex/ui/graphics_util.h>
 
-REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, true, "GPU",
+// dpour-fork: default flipped to false. Bundled with the broken-for-Downpour
+// rainbow-noise default set in SDK 0.8.1.19. Per-game A/B never isolated
+// this specific cvar but the safe choice is OFF. ~3-5% CPU cost.
+REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, false, "GPU",
                     "Execute unclipped draw vertex shader on CPU");
 
 REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_with_scissor, false, "GPU",

@@ -53,7 +53,11 @@ REXCVAR_DEFINE_STRING(resolution, "", "GPU",
                       "example: 720p, 1080p, 1440p, 4k, 1280x720)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_DOUBLE(video_mode_refresh_rate, 60.0, "GPU", "Guest video mode refresh rate in Hz")
+// dpour-fork: default raised from 60 to 120. The Xenia FPS-unlock byte patch
+// at 0x82d20f83 was reverted in the recomp so the game caps at half-vblank
+// for camera-correct 60 FPS — requires 120 Hz guest vblank pacing. See
+// `reference_downpour_60fps_cookbook.md`.
+REXCVAR_DEFINE_DOUBLE(video_mode_refresh_rate, 120.0, "GPU", "Guest video mode refresh rate in Hz")
     .range(24.0, 240.0)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 

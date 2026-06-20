@@ -53,11 +53,18 @@ REXCVAR_DEFINE_INT32(d3d12_max_frame_latency, 1, "UI/D3D12",
     .range(1, 16)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_BOOL(d3d12_present_frame_limiter, false, "UI/D3D12",
+// dpour-fork: default flipped to true. Belt-and-suspenders host present cap
+// at 60 FPS to back up the half-vblank guest cap. Without it, on a 60 Hz
+// monitor the user may see tearing; on a 120+ Hz monitor the present pace
+// outruns the guest tick rate.
+REXCVAR_DEFINE_BOOL(d3d12_present_frame_limiter, true, "UI/D3D12",
                     "Limit host presents with an explicit host-clock cadence before Present")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_DOUBLE(d3d12_present_frame_limiter_fps, 120.0, "UI/D3D12",
+// dpour-fork: default lowered from 120 to 60. Downpour's camera-correct
+// frame rate is 60 (half of 120 Hz guest vblank); the host present limiter
+// at 60 keeps host pacing aligned with guest tick rate.
+REXCVAR_DEFINE_DOUBLE(d3d12_present_frame_limiter_fps, 60.0, "UI/D3D12",
                       "Target host present rate for d3d12_present_frame_limiter")
     .range(1.0, 1000.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
