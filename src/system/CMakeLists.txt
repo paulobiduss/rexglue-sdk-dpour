@@ -1,5 +1,6 @@
 set(REXSYSTEM_SOURCES
     runtime.cpp
+    achievement_manager.cpp
     kernel_state.cpp
     xmemory.cpp
     kernel_module.cpp
