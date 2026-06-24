@@ -83,6 +83,11 @@ std::optional<std::filesystem::path> Runtime::FindMetadataPath(
   return std::nullopt;
 }
 
+std::optional<EmbeddedMetadataAsset> Runtime::FindEmbeddedMetadata(
+    const std::filesystem::path& relative_path) const {
+  return FindEmbeddedMetadataAsset(relative_path);
+}
+
 X_STATUS Runtime::Setup(RuntimeConfig config) {
   if (instance_ != nullptr) {
     REXSYS_ERROR("Runtime::Setup() called but global instance already exists");

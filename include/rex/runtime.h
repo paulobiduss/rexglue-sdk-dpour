@@ -16,9 +16,11 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 
 #include <rex/cvar.h>
+#include <rex/embedded_metadata.h>
 #include <rex/filesystem/vfs.h>
 #include <rex/memory.h>
 #include <rex/system/export_resolver.h>
@@ -131,6 +133,8 @@ class Runtime {
   // Finds a metadata file or directory. An explicit metadata_root disables
   // legacy discovery; otherwise existing project layouts remain supported.
   std::optional<std::filesystem::path> FindMetadataPath(
+      const std::filesystem::path& relative_path) const;
+  std::optional<EmbeddedMetadataAsset> FindEmbeddedMetadata(
       const std::filesystem::path& relative_path) const;
 
   // Set the app context for presentation (call before Setup)
