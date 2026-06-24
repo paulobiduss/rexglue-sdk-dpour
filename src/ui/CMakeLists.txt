@@ -4,6 +4,7 @@
 set(REXUI_CORE_SOURCES
     graphics_upload_buffer_pool.cpp
     graphics_util.cpp
+    image_decode.cpp
     imgui_dialog.cpp
     imgui_drawer.cpp
     immediate_drawer.cpp
@@ -106,6 +107,7 @@ target_include_directories(rexui PUBLIC
 )
 target_include_directories(rexui PRIVATE
     ${REXGLUE_ROOT}/src  # For ui/shaders/bytecode includes
+    ${REXGLUE_ROOT}/thirdparty/stb  # stb_image.h for icon decoding
 )
 
 target_link_libraries(rexui PUBLIC
