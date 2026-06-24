@@ -19,6 +19,7 @@ set(REXUI_CORE_SOURCES
 
 # Optional overlay dialogs
 set(REXUI_OVERLAY_SOURCES
+    overlay/achievement_icon_cache.cpp
     overlay/debug_overlay.cpp
     overlay/console_overlay.cpp
     overlay/fps_overlay.cpp
