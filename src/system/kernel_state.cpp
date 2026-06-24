@@ -9,11 +9,12 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <string>
 
 #include <fmt/format.h>
-
 #include <rex/assert.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -27,6 +28,10 @@
 #include <rex/system/kernel_module.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/function_dispatcher.h>
+#include <chrono>
+#include <thread>
+
+#include <rex/system/flags.h>
 #include <rex/system/guest_path.h>
 #include <rex/system/user_module.h>
 #include <rex/system/xevent.h>
@@ -244,6 +249,66 @@ util::XdbfGameData KernelState::module_xdbf(object_ref<UserModule> exec_module) 
     return db;
   }
   return util::XdbfGameData(nullptr, resource_size);
+}
+
+void KernelState::SetLoadedAchievements(std::vector<AchievementInfo> achievements) {
+  achievement_manager_.ReplaceAchievements(std::move(achievements));
+}
+
+AchievementListenerHandle KernelState::RegisterAchievementUnlockCallback(
+    AchievementUnlockCallback cb) {
+  return achievement_manager_.RegisterUnlockCallback(
+      [cb = std::move(cb)](const AchievementEvent& event) { cb(event.achievement); });
+}
+
+void KernelState::UnlockAchievement(uint32_t id) {
+  (void)achievement_manager_.UnlockAchievement(id, AchievementNotification::kSuppress);
+}
+
+bool KernelState::IsAchievementUnlocked(uint32_t id) const {
+  return achievement_manager_.IsUnlocked(id);
+}
+
+uint64_t KernelState::GetAchievementUnlockTime(uint32_t id) const {
+  return achievement_manager_.GetUnlockTime(id);
+}
+
+const std::vector<AchievementInfo>& KernelState::loaded_achievements() const {
+  return achievement_manager_.achievements();
+}
+
+void KernelState::LoadAchievementsData() {
+  std::vector<AchievementInfo> achievements;
+
+  const util::XdbfGameData db = title_xdbf();
+  if (db.is_valid()) {
+    const XLanguage language =
+        db.GetExistingLanguage(static_cast<XLanguage>(REXCVAR_GET(user_language)));
+    for (const auto& entry : db.GetAchievements()) {
+      AchievementInfo info;
+      info.id = entry.id;
+      info.label = db.GetStringTableEntry(language, entry.label_id);
+      info.description = db.GetStringTableEntry(language, entry.description_id);
+      info.unachieved_description = db.GetStringTableEntry(language, entry.unachieved_id);
+      info.image_id = entry.image_id;
+      info.gamerscore = entry.gamerscore;
+      info.flags = entry.flags;
+      achievements.push_back(std::move(info));
+    }
+  }
+
+  SetLoadedAchievements(std::move(achievements));
+  if (auto metadata_path = emulator_->FindMetadataPath("achievements.toml")) {
+    achievement_manager_.LoadMetadataFile(*metadata_path);
+  }
+
+  // Set up the unlock save path and restore persisted state.
+  const auto user_root = emulator_->user_data_root();
+  if (!user_root.empty()) {
+    achievement_manager_.SetUnlockSavePath(user_root / "achievements" /
+                                           fmt::format("{:08X}.toml", title_id()));
+    achievement_manager_.LoadUnlockState();
+  }
 }
 
 uint32_t KernelState::process_type() const {
@@ -618,6 +683,8 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
       REX_FATAL("Failed to create kernel dispatch thread (status {:#x})", create_status);
     }
   }
+
+  LoadAchievementsData();
 }
 
 void KernelState::LoadKernelModule(object_ref<KernelModule> kernel_module) {

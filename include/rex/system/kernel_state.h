@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <filesystem>
 #include <functional>
 #include <list>
 #include <memory>
@@ -26,6 +27,7 @@
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
 #include <rex/std_compat.h>
+#include <rex/system/achievement_manager.h>
 #include <rex/system/thread_state.h>
 #include <rex/thread/fiber.h>
 #include <rex/system/util/native_list.h>
@@ -325,12 +327,25 @@ class KernelState {
   bool Save(stream::ByteStream* stream);
   bool Restore(stream::ByteStream* stream);
 
+  void SetLoadedAchievements(std::vector<AchievementInfo> achievements);
+  void UnlockAchievement(uint32_t id);
+  bool IsAchievementUnlocked(uint32_t id) const;
+  // Returns the unlock FILETIME (100-ns intervals since 1601-01-01), or 0 if locked.
+  uint64_t GetAchievementUnlockTime(uint32_t id) const;
+  const std::vector<AchievementInfo>& loaded_achievements() const;
+  AchievementManager& achievements() { return achievement_manager_; }
+  const AchievementManager& achievements() const { return achievement_manager_; }
+
+  using AchievementUnlockCallback = std::function<void(const AchievementInfo&)>;
+  AchievementListenerHandle RegisterAchievementUnlockCallback(AchievementUnlockCallback cb);
+
  private:
   void LoadKernelModule(object_ref<KernelModule> kernel_module);
   void InitializeProcess(X_KPROCESS* process, uint32_t process_type, uint8_t unk_18, uint8_t unk_19,
                          uint8_t unk_1A);
   void SetProcessTLSVars(X_KPROCESS* process, uint32_t num_slots, uint32_t tls_data_size,
                          uint32_t tls_raw_data_address);
+  void LoadAchievementsData();
 
   Runtime* emulator_;
   memory::Memory* memory_;
@@ -374,6 +389,8 @@ class KernelState {
   std::vector<SharedLibrary> deferred_unload_libraries_;
 
   uint32_t kernel_guest_globals_ = 0;
+
+  AchievementManager achievement_manager_;
 
   std::atomic<bool> dispatch_thread_running_;
   object_ref<XHostThread> dispatch_thread_;
