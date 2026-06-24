@@ -15,6 +15,8 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
+#include <string>
 
 #include <rex/cvar.h>
 #include <rex/filesystem/vfs.h>
@@ -95,7 +97,8 @@ class Runtime {
   explicit Runtime(const std::filesystem::path& game_data_root,
                    const std::filesystem::path& user_data_root = {},
                    const std::filesystem::path& update_data_root = {},
-                   const std::filesystem::path& cache_root = {});
+                   const std::filesystem::path& cache_root = {},
+                   const std::filesystem::path& metadata_root = {});
   ~Runtime();
 
   // Non-copyable
@@ -123,6 +126,12 @@ class Runtime {
   const std::filesystem::path& user_data_root() const { return user_data_root_; }
   const std::filesystem::path& update_data_root() const { return update_data_root_; }
   const std::filesystem::path& cache_root() const { return cache_root_; }
+  const std::filesystem::path& metadata_root() const { return metadata_root_; }
+
+  // Finds a metadata file or directory. An explicit metadata_root disables
+  // legacy discovery; otherwise existing project layouts remain supported.
+  std::optional<std::filesystem::path> FindMetadataPath(
+      const std::filesystem::path& relative_path) const;
 
   // Set the app context for presentation (call before Setup)
   void set_app_context(ui::WindowedAppContext* context) { app_context_ = context; }
@@ -168,6 +177,7 @@ class Runtime {
   std::filesystem::path user_data_root_;
   std::filesystem::path update_data_root_;
   std::filesystem::path cache_root_;
+  std::filesystem::path metadata_root_;
 
   ui::WindowedAppContext* app_context_ = nullptr;
   ui::Window* display_window_ = nullptr;
