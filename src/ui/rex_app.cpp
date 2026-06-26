@@ -699,14 +699,17 @@ void ReXApp::LaunchModule() {
     // KernelState are guaranteed to exist. Done here (not OnCreateDialogs)
     // because KernelState is null during SetupPresentation.
     if (!achievement_notification_) {
-      achievement_notification_ = CreateAchievementNotificationDialog();
+      achievement_notification_ =
+          std::shared_ptr<ui::AchievementNotificationDialog>(CreateAchievementNotificationDialog());
     }
     if (achievement_notification_ && achievement_notification_listener_ == 0 && runtime_ &&
         runtime_->kernel_state()) {
-      auto* notification = achievement_notification_.get();
+      std::weak_ptr<ui::AchievementNotificationDialog> notification = achievement_notification_;
       achievement_notification_listener_ = achievements().RegisterNotificationCallback(
           [notification](const rex::system::AchievementEvent& event) {
-            notification->Push(event);
+            if (auto dialog = notification.lock()) {
+              dialog->Push(event);
+            }
           });
     }
 

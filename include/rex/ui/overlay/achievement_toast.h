@@ -14,6 +14,7 @@
 #include <chrono>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <rex/ui/overlay/achievement_notification.h>
 #include <rex/ui/overlay/achievement_icon_cache.h>
 
@@ -43,6 +44,7 @@ class AchievementToastDialog : public AchievementNotificationDialog {
   struct PendingToast {
     rex::system::AchievementEvent event;
     std::chrono::steady_clock::time_point arrived;
+    std::optional<std::chrono::steady_clock::time_point> visible_since;
   };
 
   std::mutex mutex_;

@@ -262,7 +262,7 @@ AchievementListenerHandle KernelState::RegisterAchievementUnlockCallback(
 }
 
 void KernelState::UnlockAchievement(uint32_t id) {
-  (void)achievement_manager_.UnlockAchievement(id, AchievementNotification::kSuppress);
+  (void)achievement_manager_.UnlockAchievement(id, AchievementNotification::kShow);
 }
 
 bool KernelState::IsAchievementUnlocked(uint32_t id) const {

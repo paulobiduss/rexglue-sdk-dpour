@@ -11,6 +11,8 @@
 #include <rex/ui/overlay/achievement_toast.h>
 #include <imgui.h>
 
+#include <algorithm>
+
 #include <rex/ui/immediate_drawer.h>
 
 namespace rex::ui {
@@ -30,25 +32,25 @@ void AchievementToastDialog::Push(const rex::system::AchievementEvent& event) {
 void AchievementToastDialog::OnDraw(ImGuiIO& io) {
   auto now = std::chrono::steady_clock::now();
 
+  PendingToast toast;
+  float age = 0.0f;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     while (!queue_.empty()) {
-      float age = std::chrono::duration<float>(now - queue_.front().arrived).count();
-      if (age >= kDisplaySeconds)
+      if (!queue_.front().visible_since) {
+        queue_.front().visible_since = now;
+      }
+      age = std::chrono::duration<float>(now - *queue_.front().visible_since).count();
+      if (age >= kDisplaySeconds) {
         queue_.pop_front();
-      else
+      } else {
         break;
+      }
     }
-    if (queue_.empty())
+    if (queue_.empty()) {
       return;
-  }
-
-  PendingToast toast;
-  float age;
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
+    }
     toast = queue_.front();
-    age = std::chrono::duration<float>(now - toast.arrived).count();
   }
 
   float alpha = 1.0f;
