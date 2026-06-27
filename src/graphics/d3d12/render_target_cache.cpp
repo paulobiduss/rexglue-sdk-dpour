@@ -3426,25 +3426,12 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
                       dest_color_format ==
                           xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16)) {
             a.OpMov(dxbc::Dest::O(0), dxbc::Src::R(1));
-          } else if (dest_is_color &&
-                     (dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
-                      dest_color_format ==
-                          xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) &&
-                     key.pitches_match) {
-            // DP1 fix: HDR (7e3) -> 8888 ownership transfer with value-clipping
-            // instead of bit-preservation. Without this, the raw 7e3 bits get
-            // unpacked as UNORM8 garbage, which then leaks through subsequent
-            // tonemap+alpha-blend passes wherever src.a == 0 (alpha-tested hair,
-            // foliage, statue billboards in Deadly Premonition and Downpour
-            // outdoor grass), producing the visible rainbow speckles.
-            //
-            // Smart-gated 2026-06-20: only apply when source and dest EDRAM
-            // pitches match. The Downpour Pleasant River bathroom Pass #12
-            // EID 6008 transfer has source<16t> -> dest<8t> pitch MISMATCH and
-            // needs bit-preservation instead (saturate would produce cyan/
-            // magenta checkerboard). Pitch-matched transfers are the typical
-            // foliage/alpha-test case that benefits from value-clipping.
-            a.OpMov(dxbc::Dest::O(0), dxbc::Src::R(1), true);
+          // BISECT 2026-06-22 late night: removed local 7411a9b "DP1 fix" branch
+          // here. Suspected regression that downgrades picture quality across
+          // multiple X360 titles (DP1 + Downpour) — falls through to the
+          // bit-preserving path now (upstream rexglue behaviour). Reinstate
+          // ONLY after proper diagnosis of the rainbow-speckle root cause that
+          // does not impact normal 7e3 -> 8888 transfers.
           } else {
             color_packed_in_r1x = true;
             // Float16 has a wider range for both color and alpha, also NaNs -

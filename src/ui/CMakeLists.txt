@@ -23,6 +23,7 @@ set(REXUI_OVERLAY_SOURCES
     overlay/fps_overlay.cpp
     overlay/acquire_wizard_overlay.cpp
     overlay/install_wizard_overlay.cpp
+    overlay/pso_compile_indicator_overlay.cpp
     overlay/shader_compile_overlay.cpp
     overlay/simple_settings_overlay.cpp
     overlay/settings_overlay.cpp

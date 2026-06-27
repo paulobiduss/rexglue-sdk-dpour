@@ -16,6 +16,7 @@
 #include <rex/cvar.h>
 #include <rex/math.h>
 #include <rex/hook.h>
+#include <rex/perf/guest_cpu_stall_metrics.h>
 #include <rex/system/xmemory.h>
 #include <rex/logging.h>
 
@@ -332,19 +333,24 @@ HeapDiagnostics ReXHeap::GetDiagnosticsLocked() const {
 ReXHeap g_heap;
 
 u32 RtlAllocateHeap_entry(u32 hHeap, u32 dwFlags, u32 dwBytes) {
+  rex::perf::ScopedGuestCpuTimer _guest_cpu_timer(rex::perf::GuestCpuBucket::kAlloc);
   return g_heap.Alloc(dwBytes, dwFlags & HEAP_ZERO_MEMORY);
 }
 
 u32 RtlFreeHeap_entry(u32 hHeap, u32 dwFlags, u32 ptr) {
+  rex::perf::ScopedGuestCpuTimer _guest_cpu_timer(rex::perf::GuestCpuBucket::kAlloc);
   g_heap.Free(static_cast<uint32_t>(ptr));
   return 1;
 }
 
 u32 RtlSizeHeap_entry(u32 hHeap, u32 dwFlags, u32 ptr) {
+  // Cheap size lookup, not a real allocation. Skip the timer — it'd inflate
+  // the alloc bucket with no useful signal.
   return g_heap.Size(static_cast<uint32_t>(ptr));
 }
 
 u32 RtlReAllocateHeap_entry(u32 hHeap, u32 dwFlags, u32 ptr, u32 dwBytes) {
+  rex::perf::ScopedGuestCpuTimer _guest_cpu_timer(rex::perf::GuestCpuBucket::kAlloc);
   return g_heap.Realloc(static_cast<uint32_t>(ptr), dwBytes, dwFlags & HEAP_ZERO_MEMORY);
 }
 

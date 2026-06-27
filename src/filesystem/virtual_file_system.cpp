@@ -190,6 +190,8 @@ VirtualFileSystem::~VirtualFileSystem() {
 bool VirtualFileSystem::RegisterDevice(std::unique_ptr<Device> device) {
   auto global_lock = global_critical_region_.Acquire();
   devices_.emplace_back(std::move(device));
+  // A new device may make previously-negative paths resolvable.
+  resolve_negative_cache_.clear();
   return true;
 }
 
@@ -199,6 +201,7 @@ bool VirtualFileSystem::UnregisterDevice(const std::string_view path) {
     if ((*it)->mount_path() == path) {
       REXFS_DEBUG("Unregistered device: {}", (*it)->mount_path());
       devices_.erase(it);
+      resolve_negative_cache_.clear();
       return true;
     }
   }
@@ -210,7 +213,8 @@ bool VirtualFileSystem::RegisterSymbolicLink(const std::string_view path,
   auto global_lock = global_critical_region_.Acquire();
   symlinks_.insert({std::string(path), std::string(target)});
   REXFS_DEBUG("Registered symbolic link: {} => {}", path, target);
-
+  // A new symlink may redirect previously-negative paths to a valid target.
+  resolve_negative_cache_.clear();
   return true;
 }
 
@@ -225,6 +229,7 @@ bool VirtualFileSystem::UnregisterSymbolicLink(const std::string_view path) {
   REXFS_DEBUG("Unregistered symbolic link: {} => {}", it->first, it->second);
 
   symlinks_.erase(it);
+  resolve_negative_cache_.clear();
   return true;
 }
 
@@ -264,12 +269,36 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
   // Resolve relative paths
   auto normalized_path(rex::string::utf8_canonicalize_guest_path(path));
 
+  // Negative-result cache fast-path. Game probes the same nonexistent paths
+  // many times per second (UE3 localization fallbacks, temp:\ backup-save
+  // probes, missing-monolithic-package retries). Each miss otherwise hits
+  // HostPathDevice::ResolvePath which does a case-insensitive ListFiles on
+  // the parent directory — 300-2000 ms frame stalls observed before this
+  // cache landed. The cache is keyed on the normalized path (post-symlink
+  // resolution is below, but we cache pre-resolution because most repeat
+  // probes hit the same incoming path). Invalidated by RegisterDevice /
+  // RegisterSymbolicLink / CreatePath / DeletePath.
+  if (resolve_negative_cache_.find(normalized_path) != resolve_negative_cache_.end()) {
+    REXFS_TRACE("VFS negative-cache hit for '{}'", path);
+    return nullptr;
+  }
+
   // Resolve symlinks.
   std::string resolved_path;
   bool had_symlink = ResolveSymbolicLink(normalized_path, resolved_path);
   if (had_symlink) {
     normalized_path = resolved_path;
   }
+
+  auto remember_miss = [&]() {
+    if (resolve_negative_cache_.size() >= kNegativeCacheCapacity) {
+      // Trivial drop-on-overflow: clear the whole set rather than pay an LRU
+      // tax. Negative misses tend to cluster around boot + level transitions,
+      // so a periodic full reset is fine; subsequent probes will re-warm.
+      resolve_negative_cache_.clear();
+    }
+    resolve_negative_cache_.emplace(normalized_path);
+  };
 
   // Find the device.
   auto it = std::find_if(devices_.cbegin(), devices_.cend(), [&](const auto& d) {
@@ -282,6 +311,7 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
     if (path != "ShaderDumpxe:\\CompareBackEnds") {
       REXFS_ERROR("ResolvePath({}) failed - device not found", path);
     }
+    remember_miss();
     return nullptr;
   }
 
@@ -304,6 +334,7 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
     } else {
       REXFS_WARN("VFS: entry not found for '{}' on device '{}'", path, device->mount_path());
     }
+    remember_miss();
   }
 
   return entry;
@@ -332,7 +363,35 @@ Entry* VirtualFileSystem::CreatePath(const std::string_view path, uint32_t attri
     }
     parent_entry = child_entry;
   }
-  return parent_entry->CreateEntry(path_parts[path_parts.size() - 1], attributes);
+  auto* result = parent_entry->CreateEntry(path_parts[path_parts.size() - 1], attributes);
+  if (result) {
+    // A newly-created file/dir may match a previously-cached negative path.
+    // Be surgical: only erase the specific path key (and any intermediate
+    // directories we created on the way) from the negative cache rather than
+    // nuking all 16k entries. The blanket clear was visible as multi-hundred-
+    // ms unaccounted_ms spikes during save writes / log file creation, because
+    // every subsequent missing-file probe in that frame paid the full
+    // first-miss cost again (HostPathDevice writable-path ListFiles).
+    auto global_lock = global_critical_region_.Acquire();
+    auto erase_normalized = [&](std::string_view raw) {
+      auto normalized = rex::string::utf8_canonicalize_guest_path(raw);
+      resolve_negative_cache_.erase(normalized);
+      // If a symlink mapped raw → normalized, the cache may have remembered
+      // either form (the cache key is the pre-symlink-resolution path, but
+      // we have no record of the original probe shape — try both).
+      if (normalized != std::string(raw)) {
+        resolve_negative_cache_.erase(std::string(raw));
+      }
+    };
+    erase_normalized(path);
+    std::string rebuilt(path_parts[0]);
+    erase_normalized(rebuilt);
+    for (size_t i = 1; i < path_parts.size(); ++i) {
+      rebuilt = rex::string::utf8_join_guest_paths(rebuilt, path_parts[i]);
+      erase_normalized(rebuilt);
+    }
+  }
+  return result;
 }
 
 bool VirtualFileSystem::DeletePath(const std::string_view path) {

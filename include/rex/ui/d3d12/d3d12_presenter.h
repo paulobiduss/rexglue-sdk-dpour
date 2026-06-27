@@ -138,6 +138,8 @@ class D3D12Presenter final : public Presenter {
     kGuestOutputPaintRootSignatureIndexFsrEasu,
     kGuestOutputPaintRootSignatureIndexFsrRcas,
 #endif
+    kGuestOutputPaintRootSignatureIndexColourGrade,
+    kGuestOutputPaintRootSignatureIndexBox,
 
     kGuestOutputPaintRootSignatureCount,
   };
@@ -161,6 +163,15 @@ class D3D12Presenter final : public Presenter {
       case GuestOutputPaintEffect::kFsrRcasDither:
         return kGuestOutputPaintRootSignatureIndexFsrRcas;
 #endif
+      case GuestOutputPaintEffect::kColourGrade:
+        return kGuestOutputPaintRootSignatureIndexColourGrade;
+      case GuestOutputPaintEffect::kBox:
+      case GuestOutputPaintEffect::kBoxDither:
+        // kBox uses BoxConstants (output_offset + output_size_inv +
+        // source_size + source_size_inv = 8 dwords) — wider than
+        // BilinearConstants, so it needs its own root signature with a
+        // larger Num32BitValues for the constants block.
+        return kGuestOutputPaintRootSignatureIndexBox;
       default:
         assert_unhandled_case(effect);
         return kGuestOutputPaintRootSignatureCount;

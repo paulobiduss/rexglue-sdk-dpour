@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -400,12 +401,20 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Returns a buffer for reading GPU data back to the CPU. Assuming
   // synchronizing immediately after use. Always in COPY_DEST state.
   ID3D12Resource* RequestReadbackBuffer(uint32_t size);
+  // Triple-buffered: the slot we read from this frame was written 2 frames
+  // ago, which gives the GPU two full frames to finish the copy before the
+  // CPU consumes it. In steady state the read slot is almost always already
+  // complete so the fast path stops falling back into the per-draw fence
+  // drain under heavy memexport load. Cold start now costs 2 full-path init
+  // draws per new key instead of 1; that's fine because memexport keys are
+  // reused frame after frame.
+  static constexpr uint32_t kReadbackBufferSlots = 3;
   struct ReadbackBuffer {
-    ID3D12Resource* buffers[2] = {nullptr, nullptr};
-    uint32_t sizes[2] = {0, 0};
-    void* mapped_data[2] = {nullptr, nullptr};
-    uint64_t submission_written[2] = {0, 0};
-    uint32_t written_size[2] = {0, 0};
+    ID3D12Resource* buffers[kReadbackBufferSlots] = {nullptr, nullptr, nullptr};
+    uint32_t sizes[kReadbackBufferSlots] = {0, 0, 0};
+    void* mapped_data[kReadbackBufferSlots] = {nullptr, nullptr, nullptr};
+    uint64_t submission_written[kReadbackBufferSlots] = {0, 0, 0};
+    uint32_t written_size[kReadbackBufferSlots] = {0, 0, 0};
     uint32_t current_index = 0;
     uint64_t last_used_frame = 0;
   };
@@ -467,6 +476,11 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool queue_operations_done_since_submission_signal_ = false;
 
   bool frame_open_ = false;
+  // Wall-clock timestamp of the previous frame closure (is_swap && frame_open_).
+  // Used by the PSO stall instrumentation in EndSubmission to report
+  // per-frame compile time relative to the actual frame duration. Zero means
+  // no previous frame seen yet.
+  std::chrono::steady_clock::time_point pso_stall_last_frame_close_{};
   // Guest frame index, since some transient resources can be reused across
   // submissions. Values updated in the beginning of a frame.
   uint64_t frame_current_ = 1;

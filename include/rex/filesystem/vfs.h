@@ -14,6 +14,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <rex/filesystem/device.h>
@@ -52,6 +53,19 @@ class VirtualFileSystem {
   rex::thread::global_critical_region global_critical_region_;
   std::vector<std::unique_ptr<Device>> devices_;
   std::unordered_map<std::string, std::string> symlinks_;
+
+  // Negative-result cache: paths that ResolvePath previously returned nullptr
+  // for. UE3/Downpour probes hundreds of nonexistent files per second (jpn_SF
+  // localization, temp:\T_PART_VISIBILITY, etc.). Each miss triggered a full
+  // case-insensitive directory listing in HostPathDevice::ResolvePath, which
+  // caused 300-2000 ms frame stalls. Caching the "not found" verdict turns
+  // repeated probes into an O(1) hash lookup. Cleared on RegisterDevice /
+  // RegisterSymbolicLink / CreatePath so a path that becomes valid stops
+  // returning stale-negative.
+  std::unordered_set<std::string> resolve_negative_cache_;
+  // Sized so a typical session never evicts. Each entry is ~50 bytes string;
+  // 16k entries = ~800 KB worst case.
+  static constexpr size_t kNegativeCacheCapacity = 16384;
 
   bool ResolveSymbolicLink(const std::string_view path, std::string& result);
 };

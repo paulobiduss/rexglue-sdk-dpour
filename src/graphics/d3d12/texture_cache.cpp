@@ -19,6 +19,7 @@
 
 #include <rex/assert.h>
 #include <rex/dbg.h>
+#include <rex/cvar.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/graphics/d3d12/texture_cache.h>
@@ -31,6 +32,8 @@
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+
+REXCVAR_DECLARE(bool, log_scale_chain);
 
 namespace rex::graphics::d3d12 {
 
@@ -1410,6 +1413,25 @@ ID3D12Resource* D3D12TextureCache::RequestSwapTexture(D3D12_SHADER_RESOURCE_VIEW
     *height_unscaled_out = key.GetHeight();
   }
   format_out = key.format;
+
+  if (REXCVAR_GET(log_scale_chain)) {
+    static uint32_t swap_tex_log_counter = 0;
+    if (swap_tex_log_counter++ < 30) {
+      D3D12_RESOURCE_DESC desc = texture_resource->GetDesc();
+      REXGPU_WARN(
+          "SWAP_TEX[{}]: addr=0x{:08X} key.tiled={} key.scaled_resolve={} "
+          "key.logical={}x{} d3d_physical={}x{} draw_scale={}x{} draw_scaled={} "
+          "format={} scaled_supported={}",
+          swap_tex_log_counter, uint32_t(key.base_page << 12),
+          int(key.tiled), int(key.scaled_resolve),
+          key.GetWidth(), key.GetHeight(),
+          uint32_t(desc.Width), uint32_t(desc.Height),
+          draw_resolution_scale_x(), draw_resolution_scale_y(),
+          int(IsDrawResolutionScaled()), int(key.format),
+          int(IsScaledResolveSupportedForFormat(key)));
+    }
+  }
+
   return texture_resource;
 }
 

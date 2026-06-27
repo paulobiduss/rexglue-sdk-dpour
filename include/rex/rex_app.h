@@ -55,6 +55,7 @@ struct PathConfig {
 namespace ui {
 class ConsoleDialog;
 class FpsOverlayDialog;
+class PsoCompileIndicatorDialog;
 class SettingsDialog;
 }  // namespace ui
 
@@ -246,6 +247,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::unique_ptr<ui::ConsoleDialog> console_overlay_;
   std::unique_ptr<ui::SettingsDialog> settings_overlay_;
   std::unique_ptr<ui::FpsOverlayDialog> fps_overlay_;
+  std::unique_ptr<ui::PsoCompileIndicatorDialog> pso_compile_indicator_overlay_;
   ui::DebugOverlayDialog::FrameStatsProvider frame_stats_provider_;
   std::filesystem::path config_path_;
 };

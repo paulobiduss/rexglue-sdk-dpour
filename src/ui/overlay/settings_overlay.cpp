@@ -486,6 +486,19 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
         if (ImGui::Button(std::string(entry.name + "##v").c_str())) {
           entry.command_callback();
         }
+      } else if (entry.name == "pso_missing_policy") {
+        // String-enum: explicit dropdown so user doesn't have to type+ENTER.
+        static const char* kOpts[] = {"skip", "block", "sync"};
+        int current = 0;
+        for (int i = 0; i < 3; ++i) {
+          if (current_val == kOpts[i]) {
+            current = i;
+            break;
+          }
+        }
+        if (ImGui::Combo("##v", &current, kOpts, 3)) {
+          rex::cvar::SetFlagByName(entry.name, kOpts[current]);
+        }
       } else {
         char buf[256];
         std::strncpy(buf, current_val.c_str(), sizeof(buf) - 1);

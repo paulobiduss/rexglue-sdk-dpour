@@ -22,6 +22,7 @@
 #include <rex/ui/overlay/console_overlay.h>
 #include <rex/ui/overlay/debug_overlay.h>
 #include <rex/ui/overlay/fps_overlay.h>
+#include <rex/ui/overlay/pso_compile_indicator_overlay.h>
 #include <rex/ui/overlay/settings_overlay.h>
 #include <rex/ui/overlay/shader_compile_overlay.h>
 #include <rex/graphics/graphics_system.h>
@@ -451,14 +452,14 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     if (input_sys) {
       input_sys->SetActiveCallback([this]() {
         // SetActiveCallback drives ALL input drivers (MnK + SDL gamepad +
-        // any future ones) — returning false here disables real-controller
-        // input too, not just MnK. So this callback uses the conservative
-        // "ImGui actually wants this event" check; the MnK-specific cursor
-        // release for interactive dialogs is handled separately inside
-        // MnkInputDriver::UpdateMouseCapture (via ImGuiDrawer::
-        // HasInputCapturingDialog()), so opening F4 settings does not
-        // disable controller input.
-        if (!imgui_drawer_->HasDialogs()) {
+        // any future ones). Returning false disables real-controller input
+        // too — so we gate ONLY on dialogs that explicitly want input
+        // capture (settings overlay etc.), NOT on passive overlays like
+        // fps_overlay / debug_overlay / ShaderCompileDialog (their
+        // WantsInputCapture() returns false). Without this filter,
+        // launching with the shader-compile dialog visible at startup
+        // already disabled both gamepad and mouse and hid the cursor.
+        if (!imgui_drawer_->HasInputCapturingDialog()) {
           return true;
         }
         const auto& io = imgui_drawer_->GetIO();
@@ -586,6 +587,14 @@ bool ReXApp::SetupPresentation() {
         if (REXCVAR_GET(show_fps_counter)) {
           fps_overlay_ = std::make_unique<ui::FpsOverlayDialog>(imgui_drawer_.get(), presenter);
         }
+        // PSO compile indicator: pops in during gameplay background compiles
+        // and auto-hides ~2 s after the queue empties. Allocated once at
+        // startup; its OnDraw self-gates on the cvar so toggling at runtime
+        // is free.
+        if (!pso_compile_indicator_overlay_) {
+          pso_compile_indicator_overlay_ =
+              std::make_unique<ui::PsoCompileIndicatorDialog>(imgui_drawer_.get());
+        }
         rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {
           if (debug_overlay_) {
             debug_overlay_.reset();
@@ -710,11 +719,23 @@ std::function<void(PathConfig)> ReXApp::MakeResumeCallback() {
   return [this](PathConfig paths) {
     if (shutting_down_.load(std::memory_order_acquire))
       return;
-    if (!ConstructRuntime(std::move(paths))) {
-      app_context().QuitFromUIThread();
-      return;
-    }
-    LaunchModule();
+    // The acquire wizard's "Start Game" button calls this callback FROM INSIDE
+    // its ImGui::Draw(). ConstructRuntime/LaunchModule take seconds (XEX load,
+    // renderer init, kernel boot) — running them inline blocks the UI thread
+    // mid-frame and the window appears to hang until they finish. Defer to the
+    // next UI-thread event-loop iteration so the wizard's frame completes and
+    // its dialog tears down cleanly before heavy work begins. Mirrors the
+    // existing Mac startup path in OnInitialize.
+    app_context().CallInUIThreadDeferred(
+        [this, paths = std::move(paths)]() mutable {
+          if (shutting_down_.load(std::memory_order_acquire))
+            return;
+          if (!ConstructRuntime(std::move(paths))) {
+            app_context().QuitFromUIThread();
+            return;
+          }
+          LaunchModule();
+        });
   };
 }
 

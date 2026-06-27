@@ -66,6 +66,100 @@ class PipelineCache {
   void EndSubmission();
   bool IsCreatingPipelines();
 
+  // Per-frame metrics for correlating frame-time spikes with PSO/shader
+  // compilation work on any thread. Counters are reset by ReportFrameBoundary()
+  // each closed frame.
+  struct PipelineStallMetrics {
+    // Cache misses observed by ConfigurePipeline (sync + async).
+    std::atomic<uint32_t> frame_misses{0};
+    // Wall-clock CreateD3D12Pipeline time on the command-processor thread
+    // (use_async == false branch). This is the ONLY value that directly
+    // proves a render-thread stall.
+    std::atomic<uint64_t> frame_sync_compile_ns{0};
+    // Wall-clock CreateD3D12Pipeline time on background CreationThread(s) and
+    // the on-processor drainer. Doesn't directly block render thread, but
+    // burns CPU cycles other game threads (audio, logic) compete for, and is
+    // the suspect when async_shader_compilation == true (Windows default).
+    std::atomic<uint64_t> frame_async_compile_ns{0};
+    std::atomic<uint32_t> frame_async_completions{0};
+    // Draws that returned early in D3D12CommandProcessor::IssueDraw because
+    // the async pipeline wasn't ready yet (policy=skip).
+    std::atomic<uint32_t> frame_draws_skipped{0};
+    // Cumulative wall-clock the render thread spent spin-waiting on a
+    // pipeline state (policy=block).
+    std::atomic<uint64_t> frame_block_wait_ns{0};
+    std::atomic<uint32_t> frame_blocks{0};
+    // ExecuteCommandLists and Present timing for the closed frame — set by
+    // command_processor / presenter, drained in ReportFrameBoundary.
+    std::atomic<uint64_t> frame_submit_ns{0};
+    std::atomic<uint64_t> frame_present_ns{0};
+    std::atomic<uint64_t> frame_vs_translate_ns{0};
+    std::atomic<uint64_t> frame_ps_translate_ns{0};
+    std::atomic<uint64_t> last_blocking_pso_hash{0};
+    std::atomic<uint64_t> last_blocking_vs_hash{0};
+    std::atomic<uint64_t> last_blocking_ps_hash{0};
+    std::atomic<uint32_t> total_misses_session{0};
+    // Non-PSO spike attribution (Etap 2). When a frame_ms spike fires with
+    // pso_misses=0, these counters identify the bottleneck phase. All ns,
+    // drained per frame in ReportFrameBoundary.
+    std::atomic<uint64_t> frame_texture_request_ns{0};
+    std::atomic<uint32_t> frame_texture_request_calls{0};
+    std::atomic<uint64_t> frame_rt_resolve_ns{0};
+    std::atomic<uint32_t> frame_rt_resolve_count{0};
+    std::atomic<uint64_t> frame_submit_barriers_ns{0};
+    std::atomic<uint32_t> frame_submit_barriers_calls{0};
+    // Render-thread blocked waiting on submission_fence_->SetEventOnCompletion
+    // → WaitForSingleObject(INFINITE). Dominant component of "unaccounted_ms"
+    // when frames spike with pso_misses=0 — means GPU is busy and the CPU is
+    // waiting for it. High values point to GPU-side bottleneck (texture
+    // upload, heavy shader, driver work).
+    std::atomic<uint64_t> frame_fence_wait_ns{0};
+    std::atomic<uint32_t> frame_fence_waits{0};
+    // Per-call-site split of frame_fence_wait_ns to localize which path
+    // generates fence storms during spikes. Queue-ops = explicit
+    // out-of-submission queue Signal+SetEventOnCompletion (mostly tile-mapping
+    // updates). Submission = end-of-frame submission_fence_ wait (this is
+    // where memexport readback Case A and end-of-frame CheckSubmissionFence
+    // both funnel through). The two sub-counters sum to the totals above.
+    std::atomic<uint64_t> frame_fence_wait_qops_ns{0};
+    std::atomic<uint32_t> frame_fence_wait_qops_count{0};
+    std::atomic<uint64_t> frame_fence_wait_submission_ns{0};
+    std::atomic<uint32_t> frame_fence_wait_submission_count{0};
+  };
+  const PipelineStallMetrics& stall_metrics() const { return stall_metrics_; }
+  // Called from D3D12CommandProcessor on each frame closure (is_swap &&
+  // frame_open_). frame_duration_ns is the wall-clock delta between the
+  // previous closure and this one.
+  void ReportFrameBoundary(uint64_t frame_duration_ns);
+  // Called by D3D12CommandProcessor::IssueDraw when a draw is dropped because
+  // the PSO is still being compiled on a background creation thread (policy=skip).
+  void NoteDrawSkippedAwaitingAsyncPipeline();
+  // Called from IssueDraw after a spin-wait on pipeline.state (policy=block);
+  // wait_ns is the wall-clock time the render thread spent waiting.
+  void NoteRenderThreadBlockedOnAsyncPipeline(uint64_t wait_ns);
+  // Called from D3D12CommandProcessor::EndSubmission around the
+  // ExecuteCommandLists submit (one or more times per frame).
+  void NoteSubmitNs(uint64_t submit_ns);
+  // Called from the D3D12 presenter around IDXGISwapChain::Present.
+  // Note: the presenter writes via the free-function
+  // PsoStallPresentNsAccumulator() in pso_stall_present_accumulator.h to
+  // avoid pulling the full PipelineCache header (and its xxhash transitive
+  // dep) into the ui CMake target.
+  void NotePresentNs(uint64_t present_ns);
+  // Non-PSO spike attribution probes (Etap 2). Cheap fetch_add wrappers
+  // around per-frame counters; drained in ReportFrameBoundary. Call from
+  // each call-site wrapped with std::chrono::steady_clock pair around the
+  // exact work being measured.
+  void NoteTextureRequestNs(uint64_t ns);
+  void NoteRtResolveNs(uint64_t ns);
+  void NoteSubmitBarriersNs(uint64_t ns);
+  void NoteFenceWaitNs(uint64_t ns);
+  // Per-call-site variants. Each updates BOTH the matching sub-counter AND
+  // the legacy frame_fence_wait_ns total so downstream consumers continue
+  // working.
+  void NoteFenceWaitQueueOpsNs(uint64_t ns);
+  void NoteFenceWaitSubmissionNs(uint64_t ns);
+
   D3D12Shader* LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
                           uint32_t dword_count);
   // Analyze shader microcode on the translator thread.
@@ -294,6 +388,11 @@ class PipelineCache {
   bool PrepareRuntimeDescriptionForQueuedCreation(Pipeline* pipeline,
                                                   PipelineRuntimeDescription& runtime_description);
 
+  // Background-path probes (CreationThread + drainer). Counterparts live in
+  // PipelineStallMetrics; ReportFrameBoundary() drains them per frame.
+  void NoteAsyncCompile(uint64_t compile_ns,
+                        const PipelineRuntimeDescription& runtime_description);
+
   D3D12CommandProcessor& command_processor_;
   const RegisterFile& register_file_;
   const D3D12RenderTargetCache& render_target_cache_;
@@ -342,6 +441,31 @@ class PipelineCache {
   // Xenos pixel shader provided.
   std::vector<uint8_t> depth_only_pixel_shader_;
 
+  // Provenance of a Pipeline entry. Used for Phase-1 capture summary so
+  // sessions can answer "how many of the PSOs I encountered today were
+  // prewarmed from the shareable .xpso, vs cold-compiled mid-gameplay".
+  // Stored only in-memory; not written back into the existing .xpso binary
+  // format (that format stays byte-stable for older builds).
+  enum class PipelineOrigin : uint8_t {
+    kUnknown = 0,
+    kBootReplay = 1,    // created during InitializeShaderStorage cache replay
+    kRuntimeMiss = 2,   // first encounter happened during gameplay
+  };
+
+  // Live usage stats for a Pipeline. Atomic because creation threads, the
+  // command-processor thread, and the cache hit path can all touch a
+  // pipeline at overlapping times. Reset per session (not persisted).
+  struct PipelineMetadata {
+    std::atomic<uint64_t> usage_count{0};
+    std::atomic<uint64_t> first_frame{UINT64_MAX};
+    std::atomic<uint64_t> last_frame{0};
+    PipelineOrigin origin = PipelineOrigin::kUnknown;
+    // True iff the Pipeline was first observed via a runtime miss in
+    // ConfigurePipeline (i.e. NOT pre-populated from cache replay). Drives
+    // the "Runtime misses" counter in the end-of-session summary.
+    bool caused_runtime_miss = false;
+  };
+
   struct Pipeline {
     // nullptr if creation has failed.
     std::atomic<ID3D12PipelineState*> state{nullptr};
@@ -350,6 +474,7 @@ class PipelineCache {
     D3D12Shader::D3D12Translation* pending_vertex_shader = nullptr;
     D3D12Shader::D3D12Translation* pending_pixel_shader = nullptr;
     uint8_t priority = 0;
+    PipelineMetadata metadata;
   };
   struct PipelineCreationPriorityComparator {
     bool operator()(const Pipeline* a, const Pipeline* b) const {
@@ -419,6 +544,59 @@ class PipelineCache {
   // creation_request_cond_ when set.
   size_t creation_threads_shutdown_from_ = SIZE_MAX;
   std::vector<std::unique_ptr<rex::thread::Thread>> creation_threads_;
+
+  // Stall instrumentation (see ReportFrameBoundary in the public section).
+  PipelineStallMetrics stall_metrics_;
+  std::atomic<uint32_t> spike_frame_counter_{0};
+  // Full description of the most recent PSO that blocked the command-processor
+  // thread on a synchronous compile. Stored under a mutex (rare update, rare
+  // read) so the per-frame log can dump every field we care about for the
+  // future cache/prewarm step (RT formats, depth/stencil state, blend hashes).
+  std::mutex last_blocking_description_mutex_;
+  PipelineDescription last_blocking_description_{};
+  bool last_blocking_description_valid_ = false;
+
+  // ID3D12PipelineLibrary blob cache. Caches driver-compiled PSO microcode
+  // across runs on the same GPU/driver. LoadGraphicsPipeline hit on a hot
+  // pipeline is ~5-50 us; cold compile is 100-800 ms for ROV PSOs in this
+  // title. Spec requires single-threaded access to the library, so calls are
+  // serialized under pipeline_library_mutex_; the expensive
+  // CreateGraphicsPipelineState() fallback stays OUTSIDE the lock so the
+  // existing parallel creation thread pool keeps its parallelism on cold
+  // boot. The blob memory must outlive pipeline_library_, so the read buffer
+  // is kept in pipeline_library_blob_.
+  Microsoft::WRL::ComPtr<ID3D12PipelineLibrary> pipeline_library_;
+  std::vector<uint8_t> pipeline_library_blob_;
+  std::filesystem::path pipeline_library_path_;
+  std::mutex pipeline_library_mutex_;
+  std::atomic<uint32_t> pipeline_library_load_hits_{0};
+  std::atomic<uint32_t> pipeline_library_store_count_{0};
+  std::atomic<uint32_t> pipeline_library_store_failures_{0};
+  std::atomic<bool> pipeline_library_dirty_{false};
+
+  // Phase-1 portable-cache metadata. Sidecar `*.xpso.meta.toml` carries the
+  // header (versions, hashes); per-pipeline usage stats live in-memory only.
+  std::filesystem::path pipeline_metadata_sidecar_path_;
+  std::atomic<uint64_t> session_frame_counter_{0};
+  // Session-summary counters - written into the end-of-session log line in
+  // ShutdownShaderStorage. Set/incremented from creation + hit paths.
+  std::atomic<uint64_t> session_portable_keys_loaded_{0};
+  std::atomic<uint64_t> session_prewarmed_pipelines_{0};
+  std::atomic<uint64_t> session_runtime_misses_{0};
+  std::atomic<uint64_t> session_spikes_over_16ms_{0};
+  std::atomic<uint64_t> session_spikes_over_100ms_{0};
+  std::atomic<uint64_t> session_new_keys_captured_{0};
+  bool sidecar_metadata_mismatch_ = false;
+  // Serialize pipeline_library_ to disk. Safe to call from any thread; takes
+  // pipeline_library_mutex_ internally. No-op if the library is not dirty.
+  // Used after InitializeShaderStorage (so PSOs populated from cached
+  // descriptions are captured even on hard kill) and at clean shutdown.
+  void FlushPipelineLibraryToDisk();
+
+  // Write portable-database sidecar `*.xpso.meta.toml`. Called from both the
+  // end of InitializeShaderStorage (so hard kill mid-session still leaves a
+  // valid sidecar describing the on-disk cache) and clean shutdown.
+  void WriteSidecarMetaTomlToDisk();
 };
 
 }  // namespace rex::graphics::d3d12

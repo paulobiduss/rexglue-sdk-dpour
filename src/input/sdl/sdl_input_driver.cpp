@@ -25,8 +25,90 @@ REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
                       "Path to SDL gamecontroller mappings file");
 REXCVAR_DEFINE_UINT32(hid_sdl_rumble_duration_ms, 100, "Input",
                       "SDL rumble pulse duration for nonzero XInput vibration");
+REXCVAR_DEFINE_BOOL(dualsense_adaptive_triggers, true, "Input",
+                    "Master switch for DualSense (PS5) adaptive-trigger effects. "
+                    "When true, applies the per-trigger mode + parameters from "
+                    "the dualsense_rt_* and dualsense_lt_* cvars below on every "
+                    "controller-connect event. Works over USB and Bluetooth. "
+                    "Set false to leave both triggers in pass-through analog "
+                    "mode regardless of the per-trigger settings.");
+REXCVAR_DEFINE_STRING(dualsense_rt_mode, "weapon", "Input",
+                      "DualSense right-trigger ambient effect mode. One of: "
+                      "'off' (pass-through), 'feedback' (constant resistance), "
+                      "'weapon' (sharp click at a position — gun-trigger feel), "
+                      "'vibration' (buzz throughout the pull).");
+REXCVAR_DEFINE_INT32(dualsense_rt_start, 3, "Input",
+                     "Right-trigger effect start position (0=released, "
+                     "9=fully pulled). For 'feedback' this is where resistance "
+                     "begins; for 'weapon' this is the trigger-break start.");
+REXCVAR_DEFINE_INT32(dualsense_rt_end, 6, "Input",
+                     "Right-trigger effect end position (0-9). Only used by "
+                     "'weapon' mode — the click section runs from start to end. "
+                     "Ignored by 'feedback' and 'off'.");
+REXCVAR_DEFINE_INT32(dualsense_rt_strength, 5, "Input",
+                     "Right-trigger effect strength (0-8). Higher = harder to "
+                     "pull through the resistance / click point.");
+REXCVAR_DEFINE_STRING(dualsense_lt_mode, "feedback", "Input",
+                      "DualSense left-trigger ambient effect mode. Same value "
+                      "set as dualsense_rt_mode.");
+REXCVAR_DEFINE_INT32(dualsense_lt_start, 2, "Input",
+                     "Left-trigger effect start position (0-9).");
+REXCVAR_DEFINE_INT32(dualsense_lt_end, 0, "Input",
+                     "Left-trigger effect end position (0-9). Only used by "
+                     "'weapon' mode.");
+REXCVAR_DEFINE_INT32(dualsense_lt_strength, 4, "Input",
+                     "Left-trigger effect strength (0-8).");
 
 namespace rex::input::sdl {
+
+// Translate a user-friendly DualSense trigger mode string into the DS5
+// firmware mode byte. Unknown / invalid input returns 0x00 (off) so a typo
+// disables the effect rather than crashing.
+static uint8_t DualSenseTriggerModeByte(std::string_view name) {
+  if (name == "off" || name.empty()) return 0x00;
+  if (name == "feedback") return 0x01;
+  if (name == "weapon") return 0x02;
+  if (name == "vibration") return 0x06;
+  return 0x00;
+}
+
+// Clamp an int to a uint8 in the inclusive range [lo, hi].
+static uint8_t DualSenseClampByte(int32_t v, int32_t lo, int32_t hi) {
+  return static_cast<uint8_t>(std::clamp(v, lo, hi));
+}
+
+namespace {
+constexpr size_t kDualSenseTriggerEffectSize = 11;
+constexpr size_t kDualSenseRtOffset = 10;
+constexpr size_t kDualSenseLtOffset = 21;
+
+// Fill an 11-byte trigger-effect slot from cvar values. mode_byte=0 leaves
+// the slot zero-initialized (i.e. effect off / pass-through).
+void DualSenseFillTriggerEffect(uint8_t* slot, uint8_t mode_byte,
+                                int32_t start_cvar, int32_t end_cvar,
+                                int32_t strength_cvar) {
+  slot[0] = mode_byte;
+  switch (mode_byte) {
+    case 0x01: // FEEDBACK: [start, strength]
+      slot[1] = DualSenseClampByte(start_cvar, 0, 9);
+      slot[2] = DualSenseClampByte(strength_cvar, 0, 8);
+      break;
+    case 0x02: // WEAPON: [start, end, strength]
+      slot[1] = DualSenseClampByte(start_cvar, 0, 9);
+      slot[2] = DualSenseClampByte(
+          std::max(end_cvar, start_cvar + 1), 1, 9);
+      slot[3] = DualSenseClampByte(strength_cvar, 0, 8);
+      break;
+    case 0x06: // VIBRATION: [strength, frequency, start]
+      slot[1] = DualSenseClampByte(strength_cvar, 0, 8);
+      slot[2] = DualSenseClampByte(end_cvar, 0, 255); // reuse end as frequency
+      slot[3] = DualSenseClampByte(start_cvar, 0, 9);
+      break;
+    default: // OFF or unknown — leave zero
+      break;
+  }
+}
+}  // namespace
 
 SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
     : InputDriver(window, window_z_order),
@@ -490,6 +572,55 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
     // XInput seems to start with packet_number = 1 .
     state.state_changed = true;
     UpdateXCapabilities(state);
+
+    // Ambient adaptive triggers for DualSense (PS5). The X360 binary has no
+    // concept of adaptive triggers, but DualSense applies these effects in
+    // firmware so the cost is zero on the recompiled game side. We gate on
+    // SDL_GetGamepadType so non-PS5 pads are unaffected. Works over USB and
+    // Bluetooth (SDL3 handles the report-ID and CRC differences). Per-trigger
+    // mode + parameters come from the dualsense_*_mode / *_start / *_end /
+    // *_strength cvars so users can tune the feel through their TOML or the
+    // F4 overlay without rebuilding the SDK. Packet layout from
+    // SDL3 src/joystick/hidapi/SDL_hidapi_ps5.c:165 (DS5EffectsState_t).
+    if (REXCVAR_GET(dualsense_adaptive_triggers) &&
+        SDL_GetGamepadType(controller) == SDL_GAMEPAD_TYPE_PS5) {
+      const uint8_t rt_mode = DualSenseTriggerModeByte(REXCVAR_GET(dualsense_rt_mode));
+      const uint8_t lt_mode = DualSenseTriggerModeByte(REXCVAR_GET(dualsense_lt_mode));
+      uint8_t effect[47] = {};
+      // ucEnableBits1: 0x04 = right trigger, 0x08 = left trigger. Only set
+      // the bit if that trigger has a non-off mode, so an "off" cvar value
+      // truly leaves the trigger in factory pass-through.
+      effect[0] = (rt_mode ? 0x04 : 0) | (lt_mode ? 0x08 : 0);
+      DualSenseFillTriggerEffect(
+          effect + kDualSenseRtOffset, rt_mode,
+          REXCVAR_GET(dualsense_rt_start),
+          REXCVAR_GET(dualsense_rt_end),
+          REXCVAR_GET(dualsense_rt_strength));
+      DualSenseFillTriggerEffect(
+          effect + kDualSenseLtOffset, lt_mode,
+          REXCVAR_GET(dualsense_lt_start),
+          REXCVAR_GET(dualsense_lt_end),
+          REXCVAR_GET(dualsense_lt_strength));
+      if (effect[0] == 0) {
+        // Both triggers off — skip the SDL call; pass-through analog already
+        // is the default at controller-open time.
+        REXLOG_INFO(
+            "SDL OnControllerDeviceAdded: DualSense at index {} — both "
+            "triggers configured 'off', leaving in pass-through.",
+            user_id);
+      } else if (!SDL_SendGamepadEffect(controller, effect, sizeof(effect))) {
+        REXLOG_WARN(
+            "SDL OnControllerDeviceAdded: DualSense adaptive-trigger setup "
+            "failed: {}",
+            SDL_GetError());
+      } else {
+        REXLOG_INFO(
+            "SDL OnControllerDeviceAdded: DualSense at index {} — applied "
+            "RT={} LT={} from cvars.",
+            user_id, REXCVAR_GET(dualsense_rt_mode),
+            REXCVAR_GET(dualsense_lt_mode));
+      }
+    }
 
     REXLOG_INFO("SDL OnControllerDeviceAdded: Added at index {}.", user_id);
   } else {

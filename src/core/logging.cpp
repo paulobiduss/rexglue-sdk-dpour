@@ -43,6 +43,13 @@ REXCVAR_DEFINE_BOOL(log_verbose, false, "Log", "Enable verbose logging (sets lev
 
 REXCVAR_DEFINE_BOOL(log_noisy, false, "Log", "Enable noisy/high-frequency log macros");
 
+REXCVAR_DEFINE_BOOL(log_to_file, true, "Log",
+                    "Write the rotating log file (logs/<app>_NNN.log). When false, "
+                    "no log file is opened — recommended for release/player builds "
+                    "so disk I/O and rotation overhead disappear. Toggle on for "
+                    "diagnostic captures.")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DEFINE_INT32(log_flush_interval, 0, "Log", "Periodic flush interval in seconds (0 = off)")
     .range(0, 60)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -215,14 +222,19 @@ void InitLogging(const LogConfig& config) {
     g_console_sink = sink;
   }
 
-  // File sink (rotating) with sequential naming fallback
+  // File sink (rotating) with sequential naming fallback. Gated by the
+  // log_to_file cvar — release/player configs set this to false so no log
+  // file is opened at all (no NextSequentialLogPath() directory create, no
+  // rotation, no disk writes from the log path).
   std::string resolved_path;
-  if (config.log_file) {
-    resolved_path = config.log_file;
-  } else if (!config.app_name.empty()) {
-    auto log_dir = config.log_dir.empty() ? std::filesystem::current_path() / "logs"
-                                          : std::filesystem::path(config.log_dir);
-    resolved_path = NextSequentialLogPath(log_dir, config.app_name).string();
+  if (REXCVAR_GET(log_to_file)) {
+    if (config.log_file) {
+      resolved_path = config.log_file;
+    } else if (!config.app_name.empty()) {
+      auto log_dir = config.log_dir.empty() ? std::filesystem::current_path() / "logs"
+                                            : std::filesystem::path(config.log_dir);
+      resolved_path = NextSequentialLogPath(log_dir, config.app_name).string();
+    }
   }
   if (!resolved_path.empty()) {
     auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(

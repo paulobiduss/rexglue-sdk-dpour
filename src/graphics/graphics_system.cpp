@@ -42,6 +42,15 @@ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, 
     .allowed({"none", "fxaa", "fxaa_extreme"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// Launcher-only string cvar registered here so SDK LoadConfig does not warn
+// ("unknown cvar 'launcher_language'") on every boot. Launcher reads/writes
+// this from its toml; SDK only needs it to be a recognised key. No code
+// inside the SDK reads it.
+REXCVAR_DEFINE_STRING(launcher_language, "en", "Launcher",
+                      "UI language for DPourLauncher (read by launcher only; "
+                      "ignored by the SDK runtime).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "Store shaders persistently and load them when loading games to avoid "
                     "runtime spikes and freezes when playing the game not for the first time.");

@@ -419,3 +419,11 @@ FodyWeavers.xsd
 
 # CMake User Overrides
 CMakeUserPresets.json
+
+# Local backups (timestamped dev safety copies)
+**/_backup_pre_xenia_regen/
+**/_backup_2026-*/
+**/*.backup-*
+**/*.backup
+**/*.bak
+**/*.bak2

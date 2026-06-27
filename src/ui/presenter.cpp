@@ -58,8 +58,12 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 100, "UI/Presenter",
 
 #if defined(REX_HAS_FIDELITYFX_SDK)
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
-                      "Guest output effect: bilinear, cas, fsr, fsr2, fsr3")
-    .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3"})
+                      "Guest output effect: bilinear, box, cas, fsr, fsr2, fsr3. "
+                      "box = proper SSAA box-filter downsample (recommended when "
+                      "resolution_scale > 1 and the result is downsampled to the "
+                      "window). Removes the cross-hatch dither that bilinear/CAS "
+                      "leave at non-integer downsample ratios.")
+    .allowed({"bilinear", "box", "cas", "fsr", "fsr2", "fsr3"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness,
@@ -88,8 +92,9 @@ REXCVAR_DEFINE_STRING(
     .allowed({"auto", "nativeaa", "quality", "balanced", "performance", "ultra_performance"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 #else
-REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter", "Guest output effect: bilinear")
-    .allowed({"bilinear"})
+REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
+                      "Guest output effect: bilinear, box")
+    .allowed({"bilinear", "box"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 #endif
 
@@ -101,13 +106,99 @@ REXCVAR_DEFINE_BOOL(present_allow_overscan_cutoff, false, "UI/Presenter",
                     "Allow overscan cutoff based on safe area settings")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// Native colour-grade post-FX (added 2026-06-22). When enabled, the final
+// bilinear pass is replaced with an ASC-CDL grade (lift/gamma/gain) + temp
+// shift + saturation. Hot-reload safe - the swap happens per-frame inside
+// GetGuestOutputPaintFlow, so toggling at runtime is free.
+REXCVAR_DEFINE_BOOL(colour_grade_enable, true, "UI/Presenter",
+                    "Apply native colour grading to the final present pass. "
+                    "Replaces the bilinear blit with a graded copy.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_STRING(colour_grade_preset, "downpour_cinematic", "UI/Presenter",
+                      "Colour-grade preset: identity, downpour_cinematic, "
+                      "downpour_horror, vivid, noir, warm_cinema, cold_steel")
+    .allowed({"identity", "downpour_cinematic", "downpour_horror", "vivid",
+              "noir", "warm_cinema", "cold_steel"})
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_DOUBLE(colour_grade_intensity, 1.0, "UI/Presenter",
+                      "Colour-grade blend intensity (0=ungraded, 1=full preset)")
+    .range(0.0, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace {
 using GuestOutputPaintConfig = rex::ui::Presenter::GuestOutputPaintConfig;
+
+// Each preset is the SDR-domain ASC-CDL grade applied AFTER tonemap. Math
+// keys: lift biases shadows toward the lift colour, gain scales highlights
+// multiplicatively, contrast bends the curve around mid-grey, gamma is per-
+// channel 1/gamma, temperature pushes blue<->orange, tint adds rgb offset,
+// saturation is luma-based lerp.
+//
+// downpour_cinematic = baseline tweak that preserves the original mood but
+// adds slight desaturation + a cool tone shift + mild S-curve. Designed to
+// flatter Silent Hill: Downpour's HDR scene + tonemap without dramatically
+// changing the artistic intent (so it does not surprise long-time fans).
+//
+// downpour_horror = stronger cool/desaturated grade for users wanting a
+// heavier psychological-horror mood; deeper blacks, blue-tinted shadows.
+struct ColourGradePreset {
+  const char* name;
+  float lift[3];
+  float saturation;
+  float gain[3];
+  float contrast;
+  float gamma_inv[3];
+  float temperature;
+  float tint[3];
+};
+
+constexpr ColourGradePreset kColourGradePresets[] = {
+    // name              lift                  sat   gain                  cont  gamma_inv             temp   tint
+    {"identity",         {0.00f, 0.00f, 0.00f}, 1.0f, {1.00f, 1.00f, 1.00f}, 1.0f, {1.00f, 1.00f, 1.00f}, 0.00f, {0.00f, 0.00f, 0.00f}},
+    {"downpour_cinematic",
+     // Slight cool lift in shadows, neutral mids, gentle highlight blue boost.
+     // Saturation 0.92 takes the edge off the cooked X360 grade without going
+     // pale. contrast=1.08 + temperature=-0.12 give the Silent Hill flat-blue
+     // mood without crushing midtones.
+     {0.01f, 0.012f, 0.022f}, 0.92f, {0.99f, 1.00f, 1.04f}, 1.08f, {1.00f, 1.00f, 0.98f}, -0.12f, {0.00f, 0.00f, 0.012f}},
+    {"downpour_horror",
+     // Heavier cool grade, more bite. Crush blacks slightly, lift highlights
+     // toward cyan. For users who want a stronger atmospheric departure.
+     {0.005f, 0.012f, 0.030f}, 0.78f, {0.96f, 1.00f, 1.10f}, 1.16f, {1.00f, 1.00f, 0.94f}, -0.28f, {0.00f, 0.004f, 0.020f}},
+    {"vivid",
+     // Saturation push + slight contrast bump. For users who want a punchy
+     // look at the cost of fidelity.
+     {0.00f, 0.00f, 0.00f}, 1.20f, {1.02f, 1.02f, 1.02f}, 1.10f, {1.00f, 1.00f, 1.00f}, 0.00f, {0.00f, 0.00f, 0.00f}},
+    {"noir",
+     // Near-monochrome with slight blue cast. Cinematic black-and-white feel.
+     {0.00f, 0.00f, 0.010f}, 0.20f, {1.00f, 1.00f, 1.02f}, 1.18f, {1.00f, 1.00f, 1.00f}, -0.15f, {0.00f, 0.00f, 0.006f}},
+    {"warm_cinema",
+     // Warm orange highlights, slight green-yellow mids. "Movie poster" feel.
+     {0.005f, 0.005f, 0.00f}, 0.95f, {1.04f, 1.00f, 0.96f}, 1.06f, {1.00f, 1.00f, 1.00f}, 0.25f, {0.010f, 0.005f, 0.00f}},
+    {"cold_steel",
+     // Industrial cool. Stronger blue cast, low saturation, hard contrast.
+     {0.00f, 0.005f, 0.015f}, 0.85f, {0.94f, 0.98f, 1.05f}, 1.12f, {1.00f, 1.00f, 0.96f}, -0.20f, {0.00f, 0.00f, 0.010f}},
+};
+
+const ColourGradePreset& FindColourGradePreset(const std::string& name) {
+  for (const ColourGradePreset& preset : kColourGradePresets) {
+    if (name == preset.name) {
+      return preset;
+    }
+  }
+  // First entry ("identity") is the safe fallback.
+  return kColourGradePresets[0];
+}
 
 GuestOutputPaintConfig::Effect ParsePresentEffect(const std::string& effect_name) {
   std::string lowered = effect_name;
   std::transform(lowered.begin(), lowered.end(), lowered.begin(),
                  [](unsigned char c) { return char(std::tolower(c)); });
+  if (lowered == "box") {
+    return GuestOutputPaintConfig::Effect::kBox;
+  }
 #if defined(REX_HAS_FIDELITYFX_SDK)
   if (lowered == "cas") {
     return GuestOutputPaintConfig::Effect::kCas;
@@ -296,6 +387,33 @@ namespace ui {
 void Presenter::FatalErrorHostGpuLossCallback([[maybe_unused]] bool is_responsible,
                                               [[maybe_unused]] bool statically_from_ui_thread) {
   rex::FatalError("Graphics device lost (probably due to an internal error)");
+}
+
+void Presenter::InitializeColourGradeConstants(ColourGradeConstants& constants,
+                                               const GuestOutputPaintFlow& flow,
+                                               size_t effect_index) {
+  // Populate the bilinear-shape prefix (same wire format as the bilinear PS so
+  // the colour-grade PS can fetch the source identically).
+  flow.GetEffectOutputOffset(effect_index, constants.output_offset[0],
+                             constants.output_offset[1]);
+  const std::pair<uint32_t, uint32_t>& output_size = flow.effect_output_sizes[effect_index];
+  constants.output_size_inv[0] = 1.0f / float(output_size.first);
+  constants.output_size_inv[1] = 1.0f / float(output_size.second);
+
+  // Pull preset + intensity from cvars. Both are kHotReload.
+  const ColourGradePreset& preset = FindColourGradePreset(REXCVAR_GET(colour_grade_preset));
+  const float intensity = float(REXCVAR_GET(colour_grade_intensity));
+
+  for (int i = 0; i < 3; ++i) {
+    constants.lift[i] = preset.lift[i];
+    constants.gain[i] = preset.gain[i];
+    constants.gamma_inv[i] = preset.gamma_inv[i];
+    constants.tint[i] = preset.tint[i];
+  }
+  constants.saturation = preset.saturation;
+  constants.contrast = preset.contrast;
+  constants.temperature = preset.temperature;
+  constants.intensity = std::clamp(intensity, 0.0f, 1.0f);
 }
 
 Presenter::~Presenter() {
@@ -1312,6 +1430,33 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
 
   assert_not_zero(flow.effect_count);
 
+  // Box-filter + CAS-sharpen chain: when present_effect="box", replace the
+  // FINAL kBilinear pass with kBox AND append a CAS sharpen 1:1 pass behind
+  // it. Without the sharpen step the result looks "soft 720p" because a
+  // true box filter averages all source pixels in each output pixel's
+  // footprint — that kills the X360 alpha-test dither pattern but also
+  // removes legitimate high-frequency detail. CAS adds the detail back
+  // without re-introducing the dither (CAS at 1:1 is a sharpening kernel,
+  // it doesn't sample multiple input pixels per output pixel like the
+  // downsampling CasResample did).
+  // Runs before the dither swap so that present_dither=true correctly maps
+  // the new final kCasSharpen → kCasSharpenDither.
+  if (flow.effect_count > 0 &&
+      config.GetEffect() == GuestOutputPaintConfig::Effect::kBox) {
+    GuestOutputPaintEffect& last_effect = flow.effects[flow.effect_count - 1];
+    if (last_effect == GuestOutputPaintEffect::kBilinear) {
+      last_effect = GuestOutputPaintEffect::kBox;
+#if defined(REX_HAS_FIDELITYFX_SDK)
+      // Append CAS sharpen at 1:1 (same size as box output = window size).
+      if (flow.effect_count < flow.effects.size()) {
+        flow.effect_output_sizes[flow.effect_count] =
+            flow.effect_output_sizes[flow.effect_count - 1];
+        flow.effects[flow.effect_count++] = GuestOutputPaintEffect::kCasSharpen;
+      }
+#endif
+    }
+  }
+
   if (config.GetDither()) {
     // Dithering must be applied only to the final effect since resampling and
     // sharpening filters may considering the dithering noise features and
@@ -1324,6 +1469,14 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
             output_width != properties.frontbuffer_width ||
             output_height != properties.frontbuffer_height) {
           last_effect = GuestOutputPaintEffect::kBilinearDither;
+        }
+        break;
+      case GuestOutputPaintEffect::kBox:
+        // Same 8bpc gating as kBilinear.
+        if (!properties.is_8bpc || flow.effect_count > 1 ||
+            output_width != properties.frontbuffer_width ||
+            output_height != properties.frontbuffer_height) {
+          last_effect = GuestOutputPaintEffect::kBoxDither;
         }
         break;
 #if defined(REX_HAS_FIDELITYFX_SDK)
@@ -1339,6 +1492,20 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
 #endif
       default:
         break;
+    }
+  }
+
+  // Colour-grade swap. Replaces the FINAL bilinear / bilinear-dither pass
+  // with the kColourGrade pass when the cvar is on. CAS / FSR endings are
+  // intentionally not swapped here - they produce the actual swapchain
+  // content and forcing colour grade through them would require new HLSL
+  // variants. Users running CAS/FSR can disable those to get colour grading,
+  // or wait for the v2 chained colour-grade pass.
+  if (flow.effect_count > 0 && REXCVAR_GET(colour_grade_enable)) {
+    GuestOutputPaintEffect& last_effect = flow.effects[flow.effect_count - 1];
+    if (last_effect == GuestOutputPaintEffect::kBilinear ||
+        last_effect == GuestOutputPaintEffect::kBilinearDither) {
+      last_effect = GuestOutputPaintEffect::kColourGrade;
     }
   }
 

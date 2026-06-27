@@ -49,45 +49,43 @@ void ShaderCompileDialog::OnDraw(ImGuiIO& io) {
   const auto now = std::chrono::steady_clock::now();
   const auto elapsed_since_open = now - opened_at_;
 
-  const float width = std::min(720.0f, std::max(460.0f, io.DisplaySize.x - 64.0f));
-  ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
-                          ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-  ImGui::SetNextWindowSize(ImVec2(width, 0.0f), ImGuiCond_Always);
+  // Compact toast in the top-right corner — short, low padding, no font
+  // override. Matches the "Shaders ready" style the user asked for; the
+  // launch-time progress is informational, not a modal flow.
+  const float toast_width = 320.0f;
+  ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 16.0f, 16.0f), ImGuiCond_Always,
+                          ImVec2(1.0f, 0.0f));
+  ImGui::SetNextWindowSize(ImVec2(toast_width, 0.0f), ImGuiCond_Always);
+  ImGui::SetNextWindowBgAlpha(0.92f);
 
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(26.0f, 24.0f));
-  ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(14.0f, 9.0f));
-  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(12.0f, 12.0f));
-  ImGui::PushFont(nullptr, 18.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 8.0f));
+  ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f, 3.0f));
+  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f, 5.0f));
 
   if (ImGui::Begin(title_.c_str(), nullptr,
                    ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
                        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize |
-                       ImGuiWindowFlags_NoSavedSettings)) {
-    if (!subtitle_.empty()) {
-      ImGui::TextWrapped("%s", subtitle_.c_str());
-      ImGui::Spacing();
-    }
-
-    char status[200];
+                       ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                       ImGuiWindowFlags_NoNav)) {
+    char status[160];
     if (finished_seen_) {
       if (pipelines_total > 0) {
-        std::snprintf(status, sizeof(status),
-                      "Compiled %u pipeline%s in %.1f s. Starting game...",
-                      pipelines_created, pipelines_created == 1 ? "" : "s",
+        std::snprintf(status, sizeof(status), "Ready: %u PSO / %.1fs",
+                      pipelines_created,
                       std::chrono::duration<double>(finished_at_ - opened_at_).count());
       } else {
-        std::snprintf(status, sizeof(status),
-                      "Shader cache empty for this render path. Starting game...");
+        std::snprintf(status, sizeof(status), "Cache empty (cold start)");
       }
     } else if (pipelines_total > 0) {
-      std::snprintf(status, sizeof(status), "Compiling pipeline %u of %u (%u shaders translated)",
-                    pipelines_created, pipelines_total, shaders_translated);
+      std::snprintf(status, sizeof(status), "PSO %u / %u", pipelines_created, pipelines_total);
     } else if (shaders_translated > 0) {
-      std::snprintf(status, sizeof(status), "Translating Xenos shaders... (%u)", shaders_translated);
+      std::snprintf(status, sizeof(status), "Translating shaders %u", shaders_translated);
     } else {
-      std::snprintf(status, sizeof(status), "Loading shader storage...");
+      std::snprintf(status, sizeof(status), "Loading storage...");
     }
-    ImGui::TextWrapped("%s", status);
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextUnformatted(status);
+    ImGui::PopTextWrapPos();
 
     float fraction = 0.0f;
     if (finished_seen_) {
@@ -95,16 +93,11 @@ void ShaderCompileDialog::OnDraw(ImGuiIO& io) {
     } else if (pipelines_total > 0) {
       fraction = std::clamp(float(double(pipelines_created) / double(pipelines_total)), 0.0f, 1.0f);
     }
-    ImGui::ProgressBar(fraction, ImVec2(-1.0f, 28.0f));
-
-    ImGui::Spacing();
-    ImGui::TextDisabled(
-        "First launch on a new render path warms the cache; later runs are fast.");
+    ImGui::ProgressBar(fraction, ImVec2(-1.0f, 6.0f), "");
 
     ImGui::End();
   }
 
-  ImGui::PopFont();
   ImGui::PopStyleVar(3);
 
   // Two gates on dismissal: (1) init must be finished, and (2) we've held

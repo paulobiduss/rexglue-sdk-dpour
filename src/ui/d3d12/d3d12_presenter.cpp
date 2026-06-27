@@ -23,6 +23,7 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/perf/counter.h>
+#include <rex/graphics/d3d12/pso_stall_present_accumulator.h>
 #include <rex/thread.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
@@ -126,6 +127,9 @@ void PreciseWaitUntilHostTick(uint64_t target_host_tick, uint64_t host_frequency
 namespace shaders {
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_bilinear_dither_ps.h"
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_bilinear_ps.h"
+#include "ui/shaders/bytecode/d3d12_5_1/guest_output_box_dither_ps.h"
+#include "ui/shaders/bytecode/d3d12_5_1/guest_output_box_ps.h"
+#include "ui/shaders/bytecode/d3d12_5_1/guest_output_colour_grade_ps.h"
 #if defined(REX_HAS_FIDELITYFX_SDK)
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_cas_resample_dither_ps.h"
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_cas_resample_ps.h"
@@ -1085,11 +1089,17 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
             FsrEasuConstants fsr_easu;
             FsrRcasConstants fsr_rcas;
 #endif
+            ColourGradeConstants colour_grade;
+            BoxConstants box;
           } effect_constants;
           switch (guest_output_paint_root_signature_index) {
             case kGuestOutputPaintRootSignatureIndexBilinear: {
               effect_constants_size = sizeof(effect_constants.bilinear);
               effect_constants.bilinear.Initialize(guest_output_flow, i);
+            } break;
+            case kGuestOutputPaintRootSignatureIndexBox: {
+              effect_constants_size = sizeof(effect_constants.box);
+              effect_constants.box.Initialize(guest_output_flow, i);
             } break;
 #if defined(REX_HAS_FIDELITYFX_SDK)
             case kGuestOutputPaintRootSignatureIndexCasSharpen: {
@@ -1111,6 +1121,11 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
               effect_constants.fsr_rcas.Initialize(guest_output_flow, i, guest_output_paint_config);
             } break;
 #endif
+            case kGuestOutputPaintRootSignatureIndexColourGrade: {
+              effect_constants_size = sizeof(effect_constants.colour_grade);
+              Presenter::InitializeColourGradeConstants(effect_constants.colour_grade,
+                                                        guest_output_flow, i);
+            } break;
             default:
               break;
           }
@@ -1311,7 +1326,13 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   HRESULT present_result;
   {
     PROFILE_SCOPE_COUNTER(kCpuD3D12PresentUs);
+    auto present_start = std::chrono::steady_clock::now();
     present_result = paint_context_.swap_chain->Present(sync_interval, present_flags);
+    rex::graphics::d3d12::PsoStallPresentNsAccumulator().fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - present_start)
+            .count(),
+        std::memory_order_relaxed);
   }
   // Even if presentation has failed, work might have been enqueued anyway
   // internally before the failure according to Jesse Natalie from the DirectX
@@ -1489,6 +1510,45 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
   }
 #endif  // defined(REX_HAS_FIDELITYFX_SDK)
 
+  // Colour-grade pass needs the bilinear sampler back (the FFX block left
+  // NumStaticSamplers at 0).
+  guest_output_paint_root_signature_desc.NumStaticSamplers = 1;
+  guest_output_paint_root_signature_desc.pStaticSamplers = &guest_output_paint_root_sampler;
+  guest_output_paint_root_parameter_effect_constants.Constants.Num32BitValues =
+      sizeof(ColourGradeConstants) / sizeof(uint32_t);
+  {
+    ID3D12RootSignature* guest_output_paint_root_signature =
+        util::CreateRootSignature(provider_, guest_output_paint_root_signature_desc);
+    if (!guest_output_paint_root_signature) {
+      REXLOG_ERROR(
+          "D3D12Presenter: Failed to create the guest output colour grade "
+          "presentation root signature");
+      return false;
+    }
+    *(guest_output_paint_root_signatures_[kGuestOutputPaintRootSignatureIndexColourGrade]
+          .ReleaseAndGetAddressOf()) = guest_output_paint_root_signature;
+  }
+
+  // Box-filter pass — needs the bilinear sampler AND a wider constants block
+  // (BoxConstants carries source_size_inv on top of the BilinearConstants
+  // prefix; required for correct downsample math at any non-integer ratio).
+  guest_output_paint_root_signature_desc.NumStaticSamplers = 1;
+  guest_output_paint_root_signature_desc.pStaticSamplers = &guest_output_paint_root_sampler;
+  guest_output_paint_root_parameter_effect_constants.Constants.Num32BitValues =
+      sizeof(BoxConstants) / sizeof(uint32_t);
+  {
+    ID3D12RootSignature* guest_output_paint_root_signature =
+        util::CreateRootSignature(provider_, guest_output_paint_root_signature_desc);
+    if (!guest_output_paint_root_signature) {
+      REXLOG_ERROR(
+          "D3D12Presenter: Failed to create the guest output box-filter "
+          "presentation root signature");
+      return false;
+    }
+    *(guest_output_paint_root_signatures_[kGuestOutputPaintRootSignatureIndexBox]
+          .ReleaseAndGetAddressOf()) = guest_output_paint_root_signature;
+  }
+
   // Guest output painting pipelines.
   D3D12_GRAPHICS_PIPELINE_STATE_DESC guest_output_paint_pipeline_desc = {};
   guest_output_paint_pipeline_desc.VS.pShaderBytecode =
@@ -1560,6 +1620,23 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
             sizeof(shaders::guest_output_ffx_fsr_rcas_dither_ps);
         break;
 #endif
+      case GuestOutputPaintEffect::kColourGrade:
+        guest_output_paint_pipeline_desc.PS.pShaderBytecode =
+            shaders::guest_output_colour_grade_ps;
+        guest_output_paint_pipeline_desc.PS.BytecodeLength =
+            sizeof(shaders::guest_output_colour_grade_ps);
+        break;
+      case GuestOutputPaintEffect::kBox:
+        guest_output_paint_pipeline_desc.PS.pShaderBytecode = shaders::guest_output_box_ps;
+        guest_output_paint_pipeline_desc.PS.BytecodeLength =
+            sizeof(shaders::guest_output_box_ps);
+        break;
+      case GuestOutputPaintEffect::kBoxDither:
+        guest_output_paint_pipeline_desc.PS.pShaderBytecode =
+            shaders::guest_output_box_dither_ps;
+        guest_output_paint_pipeline_desc.PS.BytecodeLength =
+            sizeof(shaders::guest_output_box_dither_ps);
+        break;
       default:
         // Not supported by this implementation.
         continue;

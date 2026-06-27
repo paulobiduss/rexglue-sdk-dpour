@@ -208,6 +208,13 @@ class Presenter {
       // inputs in the presenter path.
       kFsr3,
 #endif
+      // Box-filter downsample. Correct SSAA averaging — produces the
+      // smoothest result when the internal render resolution
+      // (resolution_scale > 1) is larger than the output window. Eliminates
+      // the visible high-frequency dither that bilinear and CAS leave at
+      // non-integer downsample ratios because their 4-corner / minimax
+      // sampling skips most input pixels.
+      kBox,
     };
 
 #if defined(REX_HAS_FIDELITYFX_SDK)
@@ -479,6 +486,20 @@ class Presenter {
     kFsrRcas,
     kFsrRcasDither,
 #endif
+    // Bilinear sample + ASC-CDL colour grading. Drop-in replacement for
+    // kBilinear at the final stage when colour_grade_enable=true. The shader
+    // itself saturates output to [0,1] so a separate dither variant is not
+    // currently needed - tone curve sits below the 8bpc quantize step.
+    kColourGrade,
+    // Box-filter downsample. Drop-in for kBilinear/kBilinearDither when the
+    // source is larger than the output (SSAA path with resolution_scale > 1).
+    // Loops over source pixels in each output pixel's footprint, weighted by
+    // area overlap, producing a proper anti-aliased average. Eliminates the
+    // visible cross-hatch / dither pattern bilinear leaves at non-integer
+    // downsample ratios because bilinear only samples 4 corners and skips
+    // any structure in between.
+    kBox,
+    kBoxDither,
 
     kCount,
   };
@@ -494,6 +515,12 @@ class Presenter {
       case GuestOutputPaintEffect::kCasResampleDither:
       case GuestOutputPaintEffect::kFsrRcasDither:
 #endif
+      case GuestOutputPaintEffect::kColourGrade:
+      // Box dither is a final-only pass (8bpc dither would smear if fed into
+      // a subsequent intermediate). Plain kBox CAN be intermediate, but in
+      // practice the box pass is always the final downsample, so listing it
+      // here is consistent with how kBilinearDither is treated.
+      case GuestOutputPaintEffect::kBoxDither:
         return false;
       default:
         // The result of any other effect can be stretched with bilinear
@@ -590,6 +617,62 @@ class Presenter {
       output_size_inv[1] = 1.0f / float(output_size.second);
     }
   };
+
+  // BoxConstants — extends BilinearConstants with explicit source_size +
+  // source_size_inv. We pass source size from the host because Texture2D::
+  // GetDimensions() in HLSL can return surprising values depending on
+  // resource padding / SRV view aliasing — and the box-filter math is very
+  // sensitive to the source-vs-output ratio (a 2x error gives a 16x sample
+  // count and an obviously broken image). flow.GetEffectInputSize() is
+  // always correct: it returns the size of the texture the i-th effect
+  // samples from (guest output for i=0, previous intermediate otherwise).
+  struct BoxConstants {
+    int32_t output_offset[2];      // 0  (matches BilinearConstants prefix)
+    float output_size_inv[2];      // 8
+    float source_size[2];          // 16 - source pixels (width, height)
+    float source_size_inv[2];      // 24 - 1.0 / source_size
+
+    void Initialize(const GuestOutputPaintFlow& flow, size_t effect_index) {
+      flow.GetEffectOutputOffset(effect_index, output_offset[0], output_offset[1]);
+      const std::pair<uint32_t, uint32_t>& output_size = flow.effect_output_sizes[effect_index];
+      output_size_inv[0] = 1.0f / float(output_size.first);
+      output_size_inv[1] = 1.0f / float(output_size.second);
+      uint32_t source_width = 0;
+      uint32_t source_height = 0;
+      flow.GetEffectInputSize(effect_index, source_width, source_height);
+      source_size[0] = float(source_width);
+      source_size[1] = float(source_height);
+      source_size_inv[0] = source_width ? 1.0f / float(source_width) : 0.0f;
+      source_size_inv[1] = source_height ? 1.0f / float(source_height) : 0.0f;
+    }
+  };
+
+  // Matches the push_consts_xe cbuffer in guest_output_colour_grade_ps.hlsl.
+  // Layout is fixed across HLSL std140-ish vector alignment; do NOT reorder
+  // members without updating the shader. Members past output_size_inv form
+  // four float4 register slots (lift+saturation, gain+contrast, gamma+temp,
+  // tint+intensity) - intentional so 16-byte alignment holds.
+  struct ColourGradeConstants {
+    int32_t output_offset[2];   // matches BilinearConstants prefix
+    float output_size_inv[2];
+    float lift[3];              // offset 16 - shadow bias colour
+    float saturation;           // offset 28 - 1.0 neutral
+    float gain[3];              // offset 32 - highlight multiplier
+    float contrast;             // offset 44 - 1.0 neutral
+    float gamma_inv[3];         // offset 48 - per-channel 1/gamma
+    float temperature;          // offset 60 - -1 cool .. +1 warm
+    float tint[3];              // offset 64 - additive bias
+    float intensity;            // offset 76 - 0..1 blend with ungraded source
+  };
+  static_assert(sizeof(ColourGradeConstants) == 80,
+                "ColourGradeConstants size must match HLSL cbuffer layout");
+
+  // Populates ColourGradeConstants from the current cvar state. Reads
+  // colour_grade_preset (string) and colour_grade_intensity (double); applies
+  // the matching preset. Safe to call every frame (cvars are hot-reload).
+  static void InitializeColourGradeConstants(ColourGradeConstants& constants,
+                                             const GuestOutputPaintFlow& flow,
+                                             size_t effect_index);
 
 #if defined(REX_HAS_FIDELITYFX_SDK)
   static constexpr float CalculateCasPostSetupSharpness(float sharpness) {

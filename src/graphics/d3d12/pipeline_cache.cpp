@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -33,6 +34,9 @@
 #include <rex/filesystem.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/pipeline_cache.h>
+#include <rex/graphics/d3d12/pso_compile_indicator_state.h>
+#include <rex/perf/guest_cpu_stall_metrics.h>
+#include <rex/graphics/d3d12/pso_stall_present_accumulator.h>
 #include <rex/graphics/d3d12/render_target_cache.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
@@ -51,6 +55,62 @@
 #include <rex/types.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
+#include <toml++/toml.hpp>
+
+REXCVAR_DEFINE_DOUBLE(d3d12_pso_compile_budget_ms, 0.0, "GPU/D3D12",
+                      "Max wall-clock (ms) the render thread is allowed to wait at frame end for "
+                      "background pipeline-creation threads to finish queued PSOs. 0 = unlimited "
+                      "(current behavior: render thread blocks until ALL queued compiles done, "
+                      "causes 100-700 ms spikes on cold-cache transitions). Positive value caps "
+                      "the wait: on timeout the frame submits anyway with the still-pending PSOs "
+                      "deferred to the next frame's EndSubmission wait. Recommended starting "
+                      "values: 8.0 (one 120Hz frame) or 16.0 (one 60Hz frame). May cause brief "
+                      "missing-geometry visual artifacts while compiles roll over, but converts "
+                      "single CRITICAL 370ms spike into 2-3 MILD 80-120ms hitches. See also "
+                      "d3d12_pso_no_block_at_submission_end which short-circuits this wait "
+                      "entirely.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(d3d12_pso_no_block_at_submission_end, true, "GPU/D3D12",
+                    "When true (default), PipelineCache::EndSubmission SKIPS the render-thread "
+                    "wait on in-flight async PSO compiles entirely — the frame submits "
+                    "immediately and pending PSOs roll forward to be picked up on later frames. "
+                    "Trade: brief 'skipped-draws' visual artifact on first encounter with a new "
+                    "PSO permutation, no render-thread stall. When false, the legacy behavior "
+                    "applies: render thread waits up to d3d12_pso_compile_budget_ms at frame end, "
+                    "which produces per-frame milliseconds of stutter even with "
+                    "pso_missing_policy='skip'. Leave true unless you can't tolerate any pop-in "
+                    "and prefer stutters in exchange for guaranteed-complete geometry.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_STRING(pso_missing_policy, "skip", "GPU",
+                      "Behavior when a draw call's PSO is still being compiled on a background "
+                      "thread: 'skip' (default, current behavior — draw is dropped, geometry "
+                      "invisible this frame), 'block' (render thread spin-waits on the PSO state "
+                      "until non-null, geometry never lost but stalls the frame), 'sync' (no "
+                      "async compile at all, every miss compiles inline on the render thread)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_DOUBLE(d3d12_pso_block_per_draw_budget_ms, 8.0, "GPU/D3D12",
+                      "Per-draw wait budget (ms) when pso_missing_policy='block'. The render "
+                      "thread spin-yields up to this many ms waiting for a single draw's PSO to "
+                      "finish compiling; on timeout the draw is skipped (single sub-frame "
+                      "missing geometry, not a multi-frame freeze). Default 8.0 = half a 60Hz "
+                      "frame, so worst-case freeze stays invisible while letting fast compiles "
+                      "complete in-line. Set to 500.0 to restore the legacy 'block forever' "
+                      "behavior up to the hard safety valve.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(pso_stall_log_verbose, false, "GPU",
+                    "When true, emit PSO_STALL[compile-only] WARN lines whenever any secondary "
+                    "metric (submit_ms / present_ms / tex_req_ms / rt_resolve_ms / "
+                    "submit_barriers_ms / fence_wait_ms) crosses its 5 ms diagnostic threshold. "
+                    "These thresholds fire on every healthy GPU-bound frame (fence_wait > 5 ms is "
+                    "normal at 60 FPS), so default-on flooded the log with no actionable signal. "
+                    "Enable for deep stutter investigation; primary triggers (frame spike > 25 ms, "
+                    "PSO misses, draw skips, block_wait) keep logging regardless.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(d3d12_dxbc_disasm, false, "GPU/D3D12", "Dump DXBC disassembly");
 
 REXCVAR_DEFINE_BOOL(d3d12_dxbc_disasm_dxilconv, false, "GPU/D3D12",
@@ -60,6 +120,32 @@ REXCVAR_DEFINE_INT32(d3d12_pipeline_creation_threads, -1, "GPU/D3D12",
                      "Number of pipeline creation threads (-1 for auto)")
     .range(-1, 32)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(d3d12_pso_library_enable, true, "GPU/D3D12",
+                    "Cache compiled D3D12 PSO blobs across runs in an "
+                    "ID3D12PipelineLibrary file ('*.pso_lib' next to '.xpso'). "
+                    "On warm boot, LoadGraphicsPipeline hits skip the 100-800 ms "
+                    "driver compile per PSO and return an existing state in "
+                    "microseconds. The library is GPU/driver-specific and is "
+                    "automatically invalidated by D3D12 on driver/adapter change "
+                    "(blob is rebuilt from scratch).")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(pso_capture, false, "GPU",
+                    "When true, every runtime-miss PSO is logged at WARN with "
+                    "its full description hash + shader hashes (capture mode "
+                    "for building a portable .xpso for shipping). The .xpso "
+                    "file is written regardless; this cvar only adds verbose "
+                    "per-miss logging.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(pso_capture_dump_on_exit, false, "GPU",
+                    "When true, ShutdownShaderStorage writes a parallel "
+                    "*.xpso.capture.toml file listing every Pipeline observed "
+                    "this session (hash + origin + usage_count + first/last "
+                    "frame). Useful when bundling a shareable database for a "
+                    "release.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(d3d12_tessellation_wireframe, false, "GPU/D3D12",
                     "Render tessellation as wireframe");
@@ -266,10 +352,205 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
   std::vector<PipelineStoredDescription> pipeline_stored_descriptions;
   // <Shader hash, modification bits>.
   std::set<std::pair<uint64_t, uint64_t>> shader_translations_needed;
+  // Cache key versioning (docx §37, mandatory): include the translator and
+  // PSO-description versions in the FILENAME so a translator semantic change
+  // produces a fresh cache file instead of silently reusing a stale one. The
+  // file header still carries the magic + version check (line ~308) for the
+  // same reason. Old caches are left on disk so a downgrade can pick them
+  // back up if needed; we never automatically delete a non-matching cache.
+  const uint32_t shader_cache_key_version =
+      std::max(PipelineDescription::kVersion, DxbcShaderTranslator::Modification::kVersion);
   auto pipeline_storage_file_path =
       shader_storage_shareable_root /
-      fmt::format("{:08X}.{}.{}.d3d12.xpso", title_id, shader_storage_scale_key,
-                  edram_rov_used ? "rov" : "rtv");
+      fmt::format("{:08X}.{}.{}.v{:08X}.d3d12.xpso", title_id, shader_storage_scale_key,
+                  edram_rov_used ? "rov" : "rtv", shader_cache_key_version);
+  auto shader_storage_file_path_seed =
+      shader_storage_shareable_root /
+      fmt::format("{:08X}.{}.v{:08X}.xsh", title_id, shader_storage_scale_key,
+                  shader_cache_key_version);
+  auto pipeline_metadata_sidecar_path_seed = pipeline_storage_file_path;
+  pipeline_metadata_sidecar_path_seed += ".meta.toml";
+
+  // Seed-cache import: if no user .xpso / .xsh / sidecar for this title +
+  // scale + render path yet, copy a pre-built bundle from
+  // <exe_dir>/cache/shaders/shareable/. The shipped seed is what unblocks
+  // first-launch PSO stutter for new users — see project_SHIPPING_CONFIG.md
+  // (Phase 1 priority). Filenames must match between seed and user paths
+  // (same title_id + scale + render path + version), otherwise the seed is
+  // simply ignored. Copy is idempotent: existing user files are never
+  // overwritten.
+  {
+    std::error_code ec;
+    auto seed_root = rex::filesystem::GetExecutableFolder() / "cache" / "shaders" / "shareable";
+    if (std::filesystem::is_directory(seed_root, ec)) {
+      auto try_seed = [&](const std::filesystem::path& dest) -> bool {
+        if (std::filesystem::exists(dest, ec)) return false;
+        auto src = seed_root / dest.filename();
+        if (!std::filesystem::is_regular_file(src, ec)) return false;
+        std::filesystem::copy_file(src, dest, ec);
+        if (ec) {
+          REXGPU_INFO("PSO_DB: seed copy failed for '{}': {}",
+                      rex::path_to_utf8(dest.filename()), ec.message());
+          return false;
+        }
+        return true;
+      };
+      const bool seeded_xpso = try_seed(pipeline_storage_file_path);
+      const bool seeded_xsh = try_seed(shader_storage_file_path_seed);
+      const bool seeded_meta = try_seed(pipeline_metadata_sidecar_path_seed);
+      if (seeded_xpso || seeded_xsh || seeded_meta) {
+        REXGPU_WARN(
+            "PSO_DB: seeded user cache from <exe>/cache/shaders/shareable "
+            "(xpso={} xsh={} meta={}); this should be a one-time event on "
+            "first launch.",
+            seeded_xpso, seeded_xsh, seeded_meta);
+      }
+    }
+  }
+
+  // Portable shareable database metadata sidecar (Phase 1). Parallel to the
+  // .xpso binary; written at shutdown, validated at init. Mismatch = WARN,
+  // not silent. Stored as TOML for consistency with the rest of the SDK
+  // config files (cf. simple_settings_overlay.cpp). Per-entry binary hashes
+  // in .xpso still gate the actual data, so a mismatch is informational
+  // rather than destructive - we still attempt to load.
+  pipeline_metadata_sidecar_path_ = pipeline_storage_file_path;
+  pipeline_metadata_sidecar_path_ += ".meta.toml";
+  sidecar_metadata_mismatch_ = false;
+  session_portable_keys_loaded_.store(0, std::memory_order_relaxed);
+  session_prewarmed_pipelines_.store(0, std::memory_order_relaxed);
+  session_runtime_misses_.store(0, std::memory_order_relaxed);
+  session_spikes_over_16ms_.store(0, std::memory_order_relaxed);
+  session_spikes_over_100ms_.store(0, std::memory_order_relaxed);
+  session_new_keys_captured_.store(0, std::memory_order_relaxed);
+  session_frame_counter_.store(0, std::memory_order_relaxed);
+  {
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(pipeline_metadata_sidecar_path_, ec)) {
+      try {
+        auto sidecar = toml::parse_file(pipeline_metadata_sidecar_path_.string());
+        const uint32_t got_title_id =
+            uint32_t(sidecar["title_id"].value_or(int64_t(0)));
+        const uint32_t got_desc_ver =
+            uint32_t(sidecar["description_version"].value_or(int64_t(0)));
+        const uint32_t got_mod_ver =
+            uint32_t(sidecar["modification_version"].value_or(int64_t(0)));
+        const std::string got_render_path =
+            sidecar["render_path"].value_or<std::string>("");
+        const int64_t got_scale_x = sidecar["scale_x"].value_or(int64_t(0));
+        const int64_t got_scale_y = sidecar["scale_y"].value_or(int64_t(0));
+        const std::string want_render_path = edram_rov_used ? "rov" : "rtv";
+        if (got_title_id != title_id || got_desc_ver != PipelineDescription::kVersion ||
+            got_mod_ver != DxbcShaderTranslator::Modification::kVersion ||
+            got_render_path != want_render_path ||
+            got_scale_x != int64_t(draw_resolution_scale_x) ||
+            got_scale_y != int64_t(draw_resolution_scale_y)) {
+          REXGPU_WARN(
+              "PSO_DB: sidecar metadata mismatch at '{}' "
+              "(got title=0x{:08X} desc_ver=0x{:08X} mod_ver=0x{:08X} path={} {}x{}; "
+              "want title=0x{:08X} desc_ver=0x{:08X} mod_ver=0x{:08X} path={} {}x{}). "
+              "Per-entry hashes in the .xpso file will still gate the actual data; "
+              "this warning is informational - rebuild the sidecar by clean-exiting "
+              "this session.",
+              rex::path_to_utf8(pipeline_metadata_sidecar_path_), got_title_id, got_desc_ver,
+              got_mod_ver, got_render_path, got_scale_x, got_scale_y, title_id,
+              PipelineDescription::kVersion, DxbcShaderTranslator::Modification::kVersion,
+              want_render_path, draw_resolution_scale_x, draw_resolution_scale_y);
+          sidecar_metadata_mismatch_ = true;
+        } else {
+          REXGPU_INFO("PSO_DB: sidecar metadata OK at '{}'",
+                      rex::path_to_utf8(pipeline_metadata_sidecar_path_));
+        }
+      } catch (const toml::parse_error& e) {
+        REXGPU_WARN("PSO_DB: sidecar parse failure at '{}': {}",
+                    rex::path_to_utf8(pipeline_metadata_sidecar_path_), e.description());
+        sidecar_metadata_mismatch_ = true;
+      }
+    }
+  }
+
+  // Initialize ID3D12PipelineLibrary blob cache. Stored next to .xpso under
+  // the same versioning so a SDK bump on PSO description or shader
+  // modification invalidates both. The library is GPU-/driver-specific; on a
+  // driver mismatch CreatePipelineLibrary returns
+  // D3D12_ERROR_DRIVER_VERSION_MISMATCH or D3D12_ERROR_ADAPTER_NOT_FOUND, and
+  // we transparently start from an empty library. The blob memory must remain
+  // alive for the lifetime of the library, so pipeline_library_blob_ keeps
+  // the read buffer.
+  pipeline_library_.Reset();
+  pipeline_library_blob_.clear();
+  pipeline_library_path_.clear();
+  pipeline_library_load_hits_.store(0, std::memory_order_relaxed);
+  pipeline_library_store_count_.store(0, std::memory_order_relaxed);
+  pipeline_library_store_failures_.store(0, std::memory_order_relaxed);
+  pipeline_library_dirty_.store(false, std::memory_order_relaxed);
+  if (REXCVAR_GET(d3d12_pso_library_enable)) {
+    ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+    Microsoft::WRL::ComPtr<ID3D12Device1> device1;
+    if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device1)))) {
+      // .pso_lib lives in cache/shaders/local/ so the portable shareable
+      // dir (.xpso + .xsh + .xpso.meta.toml) is unambiguously "safe to
+      // bundle in a release", while the GPU/driver-specific blob is
+      // unambiguously "rebuilt locally per machine". This matches the
+      // user's Phase-1 spec for the bundled vs local split.
+      auto shader_storage_local_root = shader_storage_root / "local";
+      std::error_code ec;
+      std::filesystem::create_directories(shader_storage_local_root, ec);
+      pipeline_library_path_ =
+          shader_storage_local_root /
+          fmt::format("{:08X}.{}.{}.v{:08X}.d3d12.pso_lib", title_id, shader_storage_scale_key,
+                      edram_rov_used ? "rov" : "rtv", shader_cache_key_version);
+      // One-time migration: if a legacy blob exists in the old shareable/
+      // location (from 0.8.2.14 + Phase 1 builds), move it into local/ so
+      // existing users keep their warm-boot speedup transparently.
+      auto legacy_path =
+          shader_storage_shareable_root /
+          fmt::format("{:08X}.{}.{}.v{:08X}.d3d12.pso_lib", title_id, shader_storage_scale_key,
+                      edram_rov_used ? "rov" : "rtv", shader_cache_key_version);
+      if (std::filesystem::is_regular_file(legacy_path, ec) &&
+          !std::filesystem::is_regular_file(pipeline_library_path_, ec)) {
+        std::filesystem::rename(legacy_path, pipeline_library_path_, ec);
+        if (!ec) {
+          REXGPU_INFO("PSO library migrated to local/ from legacy shareable/ location");
+        }
+      }
+      FILE* lib_file = rex::filesystem::OpenFile(pipeline_library_path_, "rb");
+      if (lib_file) {
+        rex::filesystem::Seek(lib_file, 0, SEEK_END);
+        int64_t size = rex::filesystem::Tell(lib_file);
+        if (size > 0 && size < int64_t(1) << 30) {
+          pipeline_library_blob_.resize(size_t(size));
+          rex::filesystem::Seek(lib_file, 0, SEEK_SET);
+          if (fread(pipeline_library_blob_.data(), 1, pipeline_library_blob_.size(), lib_file) !=
+              pipeline_library_blob_.size()) {
+            pipeline_library_blob_.clear();
+          }
+        }
+        fclose(lib_file);
+      }
+      HRESULT hr = device1->CreatePipelineLibrary(
+          pipeline_library_blob_.empty() ? nullptr : pipeline_library_blob_.data(),
+          pipeline_library_blob_.size(), IID_PPV_ARGS(&pipeline_library_));
+      if (FAILED(hr)) {
+        // E_INVALIDARG, D3D12_ERROR_DRIVER_VERSION_MISMATCH, or
+        // D3D12_ERROR_ADAPTER_NOT_FOUND - start over with an empty library.
+        REXGPU_INFO(
+            "PSO library blob unusable (HRESULT 0x{:08X}), rebuilding from scratch", uint32_t(hr));
+        pipeline_library_blob_.clear();
+        hr = device1->CreatePipelineLibrary(nullptr, 0, IID_PPV_ARGS(&pipeline_library_));
+        if (FAILED(hr)) {
+          REXGPU_INFO("PSO library disabled (CreatePipelineLibrary failed 0x{:08X})", uint32_t(hr));
+          pipeline_library_.Reset();
+        } else {
+          pipeline_library_dirty_.store(true, std::memory_order_relaxed);
+        }
+      } else {
+        REXGPU_WARN("PSO library blob loaded ({} bytes from '{}')", pipeline_library_blob_.size(),
+                    rex::path_to_utf8(pipeline_library_path_));
+      }
+    }
+  }
+
   pipeline_storage_file_ = rex::filesystem::OpenFile(pipeline_storage_file_path, "a+b");
   if (!pipeline_storage_file_) {
     REXGPU_ERROR(
@@ -310,6 +591,10 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
           fread(pipeline_stored_descriptions.data(), sizeof(PipelineStoredDescription),
                 pipeline_storage_told_count, pipeline_storage_file_));
       size_t pipeline_storage_read_count = pipeline_stored_descriptions.size();
+      session_portable_keys_loaded_.store(uint64_t(pipeline_storage_read_count),
+                                          std::memory_order_relaxed);
+      REXGPU_WARN("PSO_DB: loaded {} portable keys from '{}'", pipeline_storage_read_count,
+                  rex::path_to_utf8(pipeline_storage_file_path));
       // Publish the upper-bound count to the launch overlay so the progress
       // bar has a denominator before the first pipeline starts compiling.
       progress.pipelines_total.store(uint32_t(pipeline_storage_read_count),
@@ -349,9 +634,11 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
 
   // Initialize the Xenos shader storage stream.
   uint64_t shader_storage_initialization_start = rex::chrono::Clock::QueryHostTickCount();
+  // Same versioning policy as the .xpso file above — keep filenames in sync.
   auto shader_storage_file_path =
-      shader_storage_shareable_root / fmt::format("{:08X}.{}.xsh", title_id,
-                                                  shader_storage_scale_key);
+      shader_storage_shareable_root /
+      fmt::format("{:08X}.{}.v{:08X}.xsh", title_id, shader_storage_scale_key,
+                  shader_cache_key_version);
   shader_storage_file_ = rex::filesystem::OpenFile(shader_storage_file_path, "a+b");
   if (!shader_storage_file_) {
     REXGPU_ERROR(
@@ -643,6 +930,9 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
                   sizeof(pipeline_runtime_description));
       new_pipeline->root_signature.store(pipeline_runtime_description.root_signature,
                                          std::memory_order_release);
+      new_pipeline->metadata.origin = PipelineOrigin::kBootReplay;
+      new_pipeline->metadata.first_frame.store(0, std::memory_order_relaxed);
+      session_prewarmed_pipelines_.fetch_add(1, std::memory_order_relaxed);
       uint32_t bound_rts = 0;
       for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
         if (pipeline_runtime_description.description.render_targets[i].used) {
@@ -666,6 +956,8 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
         {
           std::lock_guard<std::mutex> lock(creation_request_lock_);
           creation_queue_.push(new_pipeline);
+          PsoCompileIndicatorStateRef().creation_queue_size.store(
+              uint32_t(creation_queue_.size()), std::memory_order_relaxed);
         }
         creation_request_cond_.notify_one();
       } else {
@@ -751,6 +1043,25 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
   assert_not_null(storage_write_thread_);
   storage_write_thread_->set_name("D3D12 Storage writer");
 
+  // Report PSO library effectiveness after the cache replay so the user can
+  // tell hot- vs cold-cache runs apart in the log without log_level=info.
+  if (pipeline_library_) {
+    REXGPU_WARN("PSO library status after init: {} loads (warm-boot hits), {} stores "
+                "(new compiles added to library), {} failed-stores (duplicate or other)",
+                pipeline_library_load_hits_.load(std::memory_order_relaxed),
+                pipeline_library_store_count_.load(std::memory_order_relaxed),
+                pipeline_library_store_failures_.load(std::memory_order_relaxed));
+  }
+
+  // Persist the PSO library now that all cache-replayed PSOs have been
+  // created. This means even a hard-kill in mid-session preserves the
+  // bulk-populated library blob; only mid-session newly stored PSOs (rare
+  // after the first run) are lost on hard kill.
+  FlushPipelineLibraryToDisk();
+
+  // Also write the sidecar - identical defense against hard kills.
+  WriteSidecarMetaTomlToDisk();
+
   // Drop the overlay. `finished` flips before `in_progress` so the dialog's
   // poll loop sees a consistent "done -> hide" transition even if it samples
   // between the two stores.
@@ -783,8 +1094,210 @@ void PipelineCache::ShutdownShaderStorage() {
     shader_storage_file_flush_needed_ = false;
   }
 
+  // Write Phase-1 portable database sidecar.
+  WriteSidecarMetaTomlToDisk();
+
+  // Optional capture dump: when pso_capture_dump_on_exit=true, write a
+  // human-readable list of every Pipeline observed this session with full
+  // metadata. Suitable for diffing across runs and for hand-building a
+  // "minimum shippable .xpso" by inspection.
+  if (REXCVAR_GET(pso_capture_dump_on_exit) && !pipeline_metadata_sidecar_path_.empty()) {
+    auto capture_path = pipeline_metadata_sidecar_path_;
+    capture_path.replace_extension();  // strip .toml
+    capture_path += ".capture.toml";
+    FILE* cap_file = rex::filesystem::OpenFile(capture_path, "wb");
+    if (cap_file) {
+      const std::string header = fmt::format(
+          "# Per-session PSO capture from rexglue-sdk PipelineCache.\n"
+          "# Each [[pipeline]] = one unique Pipeline observed this session.\n"
+          "title_id = 0x{:08X}\n"
+          "pipeline_count = {}\n"
+          "session_frames = {}\n\n",
+          shader_storage_title_id_, pipelines_.size(),
+          session_frame_counter_.load(std::memory_order_relaxed));
+      fwrite(header.data(), 1, header.size(), cap_file);
+      for (const auto& [hash, pipeline] : pipelines_) {
+        const char* origin_str = "unknown";
+        switch (pipeline->metadata.origin) {
+          case PipelineOrigin::kBootReplay: origin_str = "boot_replay"; break;
+          case PipelineOrigin::kRuntimeMiss: origin_str = "runtime_miss"; break;
+          case PipelineOrigin::kUnknown: origin_str = "unknown"; break;
+        }
+        const auto& d = pipeline->description.description;
+        const std::string entry = fmt::format(
+            "[[pipeline]]\n"
+            "hash = 0x{:016X}\n"
+            "vs_hash = 0x{:016X}\n"
+            "ps_hash = 0x{:016X}\n"
+            "vs_modification = 0x{:016X}\n"
+            "ps_modification = 0x{:016X}\n"
+            "origin = \"{}\"\n"
+            "caused_runtime_miss = {}\n"
+            "usage_count = {}\n"
+            "first_frame = {}\n"
+            "last_frame = {}\n"
+            "rt0_used = {}\n"
+            "rt0_format = {}\n"
+            "depth_format = {}\n"
+            "msaa_samples = {}\n"
+            "cull_mode = {}\n\n",
+            hash, d.vertex_shader_hash, d.pixel_shader_hash, d.vertex_shader_modification,
+            d.pixel_shader_modification, origin_str,
+            pipeline->metadata.caused_runtime_miss ? "true" : "false",
+            pipeline->metadata.usage_count.load(std::memory_order_relaxed),
+            pipeline->metadata.first_frame.load(std::memory_order_relaxed),
+            pipeline->metadata.last_frame.load(std::memory_order_relaxed),
+            uint32_t(d.render_targets[0].used), uint32_t(d.render_targets[0].format),
+            uint32_t(d.depth_format), uint32_t(d.host_msaa_samples), uint32_t(d.cull_mode));
+        fwrite(entry.data(), 1, entry.size(), cap_file);
+      }
+      fclose(cap_file);
+      REXGPU_WARN("PSO_DB: capture dump written to '{}' ({} pipelines)",
+                  rex::path_to_utf8(capture_path), pipelines_.size());
+    } else {
+      REXGPU_WARN("PSO_DB: cannot open capture dump for write: {}",
+                  rex::path_to_utf8(capture_path));
+    }
+  }
+
+  // End-of-session summary. Aggregated counters span the entire session, not
+  // just the most recent frame, so this is the line to grep when comparing
+  // multiple runs. Skip when the call is the pre-Initialize cleanup (no
+  // pipelines exist yet, no frames have ticked) - the line would be a row of
+  // zeros and would only confuse the log reader.
+  if (!pipelines_.empty() ||
+      session_frame_counter_.load(std::memory_order_relaxed) > 0) {
+    uint64_t boot_replay_count = 0;
+    uint64_t boot_replay_used_count = 0;
+    uint64_t runtime_miss_count = 0;
+    for (const auto& [hash, pipeline] : pipelines_) {
+      if (pipeline->metadata.origin == PipelineOrigin::kBootReplay) {
+        ++boot_replay_count;
+        if (pipeline->metadata.usage_count.load(std::memory_order_relaxed) > 0) {
+          ++boot_replay_used_count;
+        }
+      } else if (pipeline->metadata.origin == PipelineOrigin::kRuntimeMiss) {
+        ++runtime_miss_count;
+      }
+    }
+    REXGPU_WARN(
+        "PSO Summary: portable_keys_loaded={} prewarmed={} prewarmed_used={} "
+        "runtime_misses={} new_keys_captured={} spikes_over_16ms={} spikes_over_100ms={} "
+        "session_frames={} sidecar_mismatch={} total_pipelines={}",
+        session_portable_keys_loaded_.load(std::memory_order_relaxed), boot_replay_count,
+        boot_replay_used_count, runtime_miss_count,
+        session_new_keys_captured_.load(std::memory_order_relaxed),
+        session_spikes_over_16ms_.load(std::memory_order_relaxed),
+        session_spikes_over_100ms_.load(std::memory_order_relaxed),
+        session_frame_counter_.load(std::memory_order_relaxed),
+        sidecar_metadata_mismatch_ ? "yes" : "no", pipelines_.size());
+  }
+
+  FlushPipelineLibraryToDisk();
+  pipeline_library_.Reset();
+  pipeline_library_blob_.clear();
+  pipeline_library_path_.clear();
+  pipeline_library_dirty_.store(false, std::memory_order_relaxed);
+
   shader_storage_cache_root_.clear();
   shader_storage_title_id_ = 0;
+}
+
+void PipelineCache::FlushPipelineLibraryToDisk() {
+  if (!pipeline_library_ || !pipeline_library_dirty_.load(std::memory_order_relaxed) ||
+      pipeline_library_path_.empty()) {
+    return;
+  }
+  SIZE_T serialized_size;
+  {
+    std::lock_guard<std::mutex> lock(pipeline_library_mutex_);
+    serialized_size = pipeline_library_->GetSerializedSize();
+  }
+  if (serialized_size == 0) {
+    return;
+  }
+  std::vector<uint8_t> serialized(serialized_size);
+  HRESULT hr;
+  {
+    std::lock_guard<std::mutex> lock(pipeline_library_mutex_);
+    hr = pipeline_library_->Serialize(serialized.data(), serialized_size);
+  }
+  if (FAILED(hr)) {
+    REXGPU_WARN("PSO library Serialize failed: HRESULT 0x{:08X}", uint32_t(hr));
+    return;
+  }
+  auto tmp_path = pipeline_library_path_;
+  tmp_path += ".tmp";
+  FILE* lib_file = rex::filesystem::OpenFile(tmp_path, "wb");
+  if (!lib_file) {
+    REXGPU_WARN("PSO library file open failed: {}", rex::path_to_utf8(tmp_path));
+    return;
+  }
+  size_t written = fwrite(serialized.data(), 1, serialized.size(), lib_file);
+  fclose(lib_file);
+  if (written != serialized.size()) {
+    REXGPU_WARN("PSO library write incomplete ({}/{} bytes), discarding", written,
+                serialized.size());
+    std::error_code ec;
+    std::filesystem::remove(tmp_path, ec);
+    return;
+  }
+  std::error_code ec;
+  std::filesystem::remove(pipeline_library_path_, ec);
+  std::filesystem::rename(tmp_path, pipeline_library_path_, ec);
+  if (ec) {
+    REXGPU_WARN("PSO library rename failed: {}", ec.message());
+    return;
+  }
+  pipeline_library_dirty_.store(false, std::memory_order_relaxed);
+  REXGPU_WARN("PSO library flushed: {} bytes, {} stores, {} hits, {} failed-stores",
+              serialized.size(),
+              pipeline_library_store_count_.load(std::memory_order_relaxed),
+              pipeline_library_load_hits_.load(std::memory_order_relaxed),
+              pipeline_library_store_failures_.load(std::memory_order_relaxed));
+}
+
+void PipelineCache::WriteSidecarMetaTomlToDisk() {
+  if (pipeline_metadata_sidecar_path_.empty() || shader_storage_title_id_ == 0) {
+    return;
+  }
+  bool edram_rov_used =
+      render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+  auto tmp_path = pipeline_metadata_sidecar_path_;
+  tmp_path += ".tmp";
+  FILE* meta_file = rex::filesystem::OpenFile(tmp_path, "wb");
+  if (!meta_file) {
+    REXGPU_WARN("PSO_DB: cannot open sidecar for write: {}",
+                rex::path_to_utf8(pipeline_metadata_sidecar_path_));
+    return;
+  }
+  const std::string text = fmt::format(
+      "# Auto-generated by rexglue-sdk PipelineCache - do NOT bundle the "
+      "matching .pso_lib in a release\n"
+      "# (it is GPU/driver-specific). The .xpso file IS portable and can "
+      "be shipped.\n"
+      "title_id = 0x{:08X}\n"
+      "description_version = 0x{:08X}\n"
+      "modification_version = 0x{:08X}\n"
+      "render_path = \"{}\"\n"
+      "scale_x = {}\n"
+      "scale_y = {}\n"
+      "graphics_preset = \"default\"\n"
+      "portable_keys_at_close = {}\n"
+      "session_runtime_misses = {}\n",
+      shader_storage_title_id_, PipelineDescription::kVersion,
+      DxbcShaderTranslator::Modification::kVersion, edram_rov_used ? "rov" : "rtv",
+      render_target_cache_.draw_resolution_scale_x(),
+      render_target_cache_.draw_resolution_scale_y(), pipelines_.size(),
+      session_runtime_misses_.load(std::memory_order_relaxed));
+  fwrite(text.data(), 1, text.size(), meta_file);
+  fclose(meta_file);
+  std::error_code ec;
+  std::filesystem::remove(pipeline_metadata_sidecar_path_, ec);
+  std::filesystem::rename(tmp_path, pipeline_metadata_sidecar_path_, ec);
+  if (ec) {
+    REXGPU_WARN("PSO_DB: sidecar rename failed: {}", ec.message());
+  }
 }
 
 void PipelineCache::EndSubmission() {
@@ -804,14 +1317,23 @@ void PipelineCache::EndSubmission() {
   }
   if (!creation_threads_.empty()) {
     CreateQueuedPipelinesOnProcessorThread();
-    // Await creation of all queued pipelines.
+    // Decide whether to await in-flight PSO creation here. When the
+    // d3d12_pso_no_block_at_submission_end cvar is true (default), we skip
+    // the wait entirely — the still-compiling PSOs roll forward to whatever
+    // frame finishes them, and any draw that hits a not-yet-ready PSO falls
+    // into the pso_missing_policy path (default 'skip' = single-frame
+    // missing-geometry artifact). This converts a per-frame 0-16ms wait
+    // into a brief one-time pop-in per new PSO permutation.
+    const bool no_block_at_submission_end =
+        REXCVAR_GET(d3d12_pso_no_block_at_submission_end);
     bool await_creation_completion_event;
     {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
       // Assuming the creation queue is already empty (because the processor
       // thread also worked on creating the leftover pipelines), so only check
       // if there are threads with pipelines currently being created.
-      await_creation_completion_event = creation_threads_busy_ != 0;
+      await_creation_completion_event =
+          !no_block_at_submission_end && creation_threads_busy_ != 0;
       if (await_creation_completion_event) {
         creation_completion_event_->Reset();
         creation_completion_set_event_ = true;
@@ -819,7 +1341,29 @@ void PipelineCache::EndSubmission() {
     }
     if (await_creation_completion_event) {
       creation_request_cond_.notify_one();
-      rex::thread::Wait(creation_completion_event_.get(), false);
+      const double budget_ms = REXCVAR_GET(d3d12_pso_compile_budget_ms);
+      if (budget_ms > 0.0) {
+        // Bounded wait: cap render-thread blocking on background PSO
+        // creation. On timeout, leftover PSOs stay in flight and the next
+        // EndSubmission picks them up. The completion event was Reset()'d
+        // above and creation_completion_set_event_ stays true, so whichever
+        // background thread finishes the last queued pipeline still sets
+        // the event for a future waiter to observe.
+        auto budget = std::chrono::milliseconds(static_cast<int64_t>(budget_ms));
+        auto wait_start = std::chrono::steady_clock::now();
+        auto wait_result = rex::thread::Wait(creation_completion_event_.get(), false, budget);
+        if (wait_result == rex::thread::WaitResult::kTimeout) {
+          // Surface this in the per-frame log via the existing stall
+          // metrics — count the timeout as a block_wait so the user can see
+          // the budget actually kicked in.
+          uint64_t wait_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - wait_start)
+                                 .count();
+          NoteRenderThreadBlockedOnAsyncPipeline(wait_ns);
+        }
+      } else {
+        rex::thread::Wait(creation_completion_event_.get(), false);
+      }
     }
   }
 }
@@ -830,6 +1374,330 @@ bool PipelineCache::IsCreatingPipelines() {
   }
   std::lock_guard<std::mutex> lock(creation_request_lock_);
   return !creation_queue_.empty() || creation_threads_busy_ != 0;
+}
+
+void PipelineCache::ReportFrameBoundary(uint64_t frame_duration_ns) {
+  // Per-session frame index, monotonic from 0 at startup. Used by Pipeline
+  // metadata for first_frame / last_frame tracking; also feeds the summary
+  // log's spike buckets. Increment FIRST so any usage in the same frame can
+  // see the new value.
+  const uint64_t frame_index = session_frame_counter_.fetch_add(1, std::memory_order_acq_rel) + 1;
+  // Spike buckets - count any frame visibly longer than 16 ms / 100 ms toward
+  // the end-of-session summary, regardless of whether a PSO compile was the
+  // cause. Lets the user spot trend changes across sessions.
+  if (frame_duration_ns > 16'000'000ull) {
+    session_spikes_over_16ms_.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (frame_duration_ns > 100'000'000ull) {
+    session_spikes_over_100ms_.fetch_add(1, std::memory_order_relaxed);
+  }
+  (void)frame_index;
+
+  // Atomically drain per-frame counters so we don't double-count.
+  const uint32_t misses = stall_metrics_.frame_misses.exchange(0, std::memory_order_acq_rel);
+  const uint64_t sync_compile_ns =
+      stall_metrics_.frame_sync_compile_ns.exchange(0, std::memory_order_acq_rel);
+  const uint64_t async_compile_ns =
+      stall_metrics_.frame_async_compile_ns.exchange(0, std::memory_order_acq_rel);
+  const uint32_t async_completions =
+      stall_metrics_.frame_async_completions.exchange(0, std::memory_order_acq_rel);
+  const uint32_t draws_skipped =
+      stall_metrics_.frame_draws_skipped.exchange(0, std::memory_order_acq_rel);
+  const uint64_t block_wait_ns =
+      stall_metrics_.frame_block_wait_ns.exchange(0, std::memory_order_acq_rel);
+  const uint32_t blocks = stall_metrics_.frame_blocks.exchange(0, std::memory_order_acq_rel);
+  const uint64_t submit_ns =
+      stall_metrics_.frame_submit_ns.exchange(0, std::memory_order_acq_rel);
+  const uint64_t present_ns =
+      PsoStallPresentNsAccumulator().exchange(0, std::memory_order_acq_rel);
+  const uint64_t vs_translate_ns =
+      stall_metrics_.frame_vs_translate_ns.exchange(0, std::memory_order_acq_rel);
+  const uint64_t ps_translate_ns =
+      stall_metrics_.frame_ps_translate_ns.exchange(0, std::memory_order_acq_rel);
+  // Non-PSO spike attribution (Etap 2). When pso_misses=0 yet frame_ms is
+  // high, these counters identify which render-thread phase ate the budget.
+  const uint64_t tex_req_ns =
+      stall_metrics_.frame_texture_request_ns.exchange(0, std::memory_order_acq_rel);
+  const uint32_t tex_req_calls =
+      stall_metrics_.frame_texture_request_calls.exchange(0, std::memory_order_acq_rel);
+  const uint64_t rt_resolve_ns =
+      stall_metrics_.frame_rt_resolve_ns.exchange(0, std::memory_order_acq_rel);
+  const uint32_t rt_resolve_count =
+      stall_metrics_.frame_rt_resolve_count.exchange(0, std::memory_order_acq_rel);
+  const uint64_t submit_barriers_ns =
+      stall_metrics_.frame_submit_barriers_ns.exchange(0, std::memory_order_acq_rel);
+  const uint32_t submit_barriers_calls =
+      stall_metrics_.frame_submit_barriers_calls.exchange(0, std::memory_order_acq_rel);
+  const uint64_t fence_wait_ns =
+      stall_metrics_.frame_fence_wait_ns.exchange(0, std::memory_order_acq_rel);
+  const uint32_t fence_waits =
+      stall_metrics_.frame_fence_waits.exchange(0, std::memory_order_acq_rel);
+  const uint64_t fence_wait_qops_ns =
+      stall_metrics_.frame_fence_wait_qops_ns.exchange(0, std::memory_order_acq_rel);
+  const uint32_t fence_wait_qops_count =
+      stall_metrics_.frame_fence_wait_qops_count.exchange(0, std::memory_order_acq_rel);
+  const uint64_t fence_wait_submission_ns =
+      stall_metrics_.frame_fence_wait_submission_ns.exchange(0, std::memory_order_acq_rel);
+  const uint32_t fence_wait_submission_count =
+      stall_metrics_.frame_fence_wait_submission_count.exchange(0, std::memory_order_acq_rel);
+  // Guest-CPU stall buckets (Class B investigation). These are written by the
+  // kernel emulation layer (file I/O, heap allocator, NtWait*) running on the
+  // guest thread, NOT the render thread. When a frame_ms spike fires with
+  // render-thread buckets all near zero, large values here pinpoint which
+  // kernel facility blocked the guest from producing Pm4 commands.
+  auto& guest_cpu = ::rex::perf::GuestCpuStallMetricsRef();
+  const uint64_t guest_io_ns =
+      guest_cpu.frame_kernel_io_ns.exchange(0, std::memory_order_acq_rel);
+  const uint32_t guest_io_calls =
+      guest_cpu.frame_kernel_io_calls.exchange(0, std::memory_order_acq_rel);
+  const uint64_t guest_alloc_ns =
+      guest_cpu.frame_alloc_ns.exchange(0, std::memory_order_acq_rel);
+  const uint32_t guest_alloc_calls =
+      guest_cpu.frame_alloc_calls.exchange(0, std::memory_order_acq_rel);
+  const uint64_t guest_wait_ns =
+      guest_cpu.frame_wait_ns.exchange(0, std::memory_order_acq_rel);
+  const uint32_t guest_wait_count =
+      guest_cpu.frame_wait_count.exchange(0, std::memory_order_acq_rel);
+
+  // Cheap exit: nothing happened on the compile path OR any non-PSO phase
+  // this frame, AND submit / present were fast (sub-5 ms), AND no significant
+  // guest-CPU stall (sub-5 ms per bucket).
+  if (misses == 0 && sync_compile_ns == 0 && async_compile_ns == 0 && draws_skipped == 0 &&
+      block_wait_ns == 0 && vs_translate_ns == 0 && ps_translate_ns == 0 &&
+      submit_ns < 5'000'000ull && present_ns < 5'000'000ull &&
+      tex_req_ns < 5'000'000ull && rt_resolve_ns < 5'000'000ull &&
+      submit_barriers_ns < 5'000'000ull && fence_wait_ns < 5'000'000ull &&
+      guest_io_ns < 5'000'000ull && guest_alloc_ns < 5'000'000ull &&
+      guest_wait_ns < 5'000'000ull) {
+    return;
+  }
+
+  const double frame_ms = static_cast<double>(frame_duration_ns) / 1e6;
+  const double sync_compile_ms = static_cast<double>(sync_compile_ns) / 1e6;
+  const double async_compile_ms = static_cast<double>(async_compile_ns) / 1e6;
+  const double block_wait_ms = static_cast<double>(block_wait_ns) / 1e6;
+  const double submit_ms = static_cast<double>(submit_ns) / 1e6;
+  const double present_ms = static_cast<double>(present_ns) / 1e6;
+  const double vs_translate_ms = static_cast<double>(vs_translate_ns) / 1e6;
+  const double ps_translate_ms = static_cast<double>(ps_translate_ns) / 1e6;
+  const double translate_ms = vs_translate_ms + ps_translate_ms;
+  const double blocking_ms = sync_compile_ms + translate_ms + block_wait_ms;
+  const double tex_req_ms = static_cast<double>(tex_req_ns) / 1e6;
+  const double rt_resolve_ms = static_cast<double>(rt_resolve_ns) / 1e6;
+  const double submit_barriers_ms = static_cast<double>(submit_barriers_ns) / 1e6;
+  const double fence_wait_ms = static_cast<double>(fence_wait_ns) / 1e6;
+  const double fence_wait_qops_ms = static_cast<double>(fence_wait_qops_ns) / 1e6;
+  const double fence_wait_submission_ms = static_cast<double>(fence_wait_submission_ns) / 1e6;
+  const double guest_io_ms = static_cast<double>(guest_io_ns) / 1e6;
+  const double guest_alloc_ms = static_cast<double>(guest_alloc_ns) / 1e6;
+  const double guest_wait_ms = static_cast<double>(guest_wait_ns) / 1e6;
+  const double guest_cpu_total_ms = guest_io_ms + guest_alloc_ms + guest_wait_ms;
+  // Accounted budget vs. wall-clock. Render-thread and guest-CPU buckets are
+  // CONCURRENT on different threads, so we don't simply sum them — instead
+  // report whichever dominated. unaccounted_ms = frame_ms - max(render, guest)
+  // would be the cleanest model, but the cheap-and-clear approach is to keep
+  // the original render-thread accounted total and report guest_cpu_total_ms
+  // alongside. A high guest_cpu_total_ms with low render-thread totals
+  // = guest thread starved the command processor (Class B).
+  const double accounted_render_thread_ms = sync_compile_ms + translate_ms + block_wait_ms +
+                                             submit_ms + present_ms + tex_req_ms + rt_resolve_ms +
+                                             submit_barriers_ms + fence_wait_ms;
+  const double accounted_max_ms = (accounted_render_thread_ms > guest_cpu_total_ms)
+                                       ? accounted_render_thread_ms
+                                       : guest_cpu_total_ms;
+  const double unaccounted_ms = frame_ms - accounted_max_ms;
+
+  // Severity bucket from frame wall-clock duration. CRITICAL > 250 ms is a
+  // multi-frame freeze, EXTREME > 100 ms is a visible hitch, etc.
+  //
+  // 2026-06-27 (fix #5): bumped default MILD/HIGH thresholds behind
+  // pso_stall_log_verbose. With Downpour sustaining median frame_ms = 33.6 ms
+  // (30 FPS baseline) and triple-buffer + targeted memexport wait now keeping
+  // fence_waits = 0-1 per frame in steady state, the 25 ms / 33 ms thresholds
+  // tripped on every healthy 30 FPS frame and produced 800+ PSO_STALL events
+  // per minute — pure log noise, no signal. Default now logs only SEVERE+
+  // (> 50 ms — actual visible hitches). Verbose mode re-enables the MILD/HIGH
+  // buckets for deep investigation.
+  const bool verbose = REXCVAR_GET(pso_stall_log_verbose);
+  const char* severity = nullptr;
+  if (frame_ms > 250.0) {
+    severity = "CRITICAL";
+  } else if (frame_ms > 100.0) {
+    severity = "EXTREME";
+  } else if (frame_ms > 50.0) {
+    severity = "SEVERE";
+  } else if (verbose && frame_ms > 33.0) {
+    severity = "HIGH";
+  } else if (verbose && frame_ms > 25.0) {
+    severity = "MILD";
+  }
+
+  // Conditional skip: only log if SOMETHING is interesting. This keeps the
+  // log from being flooded by every frame that ran a tiny translate but was
+  // otherwise smooth — that work is below the noise floor for stutter
+  // analysis. Thresholds picked per user spec.
+  // Primary triggers — always log these (genuinely abnormal frames):
+  const bool log_for_frame_spike = severity != nullptr;             // frame_ms > 50 (or > 25 in verbose)
+  const bool log_for_misses = misses > 0;                            // PSO had to compile
+  const bool log_for_skipped = draws_skipped > 0;                   // missed PSOs in skip mode
+  const bool log_for_block = block_wait_ms > 1.0;                   // block-mode wall-clock
+  const bool log_for_compile = sync_compile_ms > 5.0 || async_compile_ms > 5.0;
+  const bool log_for_translate = translate_ms > 5.0;                 // shader translate
+  // Secondary triggers — these fire on every healthy GPU-bound frame (fence
+  // wait > 5 ms is just "GPU is doing work"; submit/present/tex_req/rt_resolve
+  // > 5 ms happens on big scenes by design). Useful when investigating a
+  // specific spike, but as default warn lines they flood the log on every
+  // frame at 15-25 ms and contribute their own CPU+IO cost. Gate them behind
+  // the opt-in `pso_stall_log_verbose` cvar (read once above, near severity).
+  const bool log_for_submit = verbose && submit_ms > 5.0;
+  const bool log_for_present = verbose && present_ms > 5.0;
+  const bool log_for_tex_req = verbose && tex_req_ms > 5.0;
+  const bool log_for_rt_resolve = verbose && rt_resolve_ms > 5.0;
+  const bool log_for_submit_barriers = verbose && submit_barriers_ms > 5.0;
+  const bool log_for_fence_wait = verbose && fence_wait_ms > 5.0;
+  // Guest-CPU stall trigger — PRIMARY (not verbose-gated) so Class B
+  // investigation surfaces guest-thread block frames even if no render-thread
+  // bucket is interesting. 5 ms threshold matches the secondary triggers.
+  const bool log_for_guest_cpu = guest_cpu_total_ms > 5.0;
+  if (!(log_for_frame_spike || log_for_misses || log_for_compile || log_for_translate ||
+        log_for_skipped || log_for_block || log_for_submit || log_for_present ||
+        log_for_tex_req || log_for_rt_resolve || log_for_submit_barriers || log_for_fence_wait ||
+        log_for_guest_cpu)) {
+    return;
+  }
+
+  const uint64_t blocking_pso = stall_metrics_.last_blocking_pso_hash.load(std::memory_order_relaxed);
+  const uint64_t blocking_vs = stall_metrics_.last_blocking_vs_hash.load(std::memory_order_relaxed);
+  const uint64_t blocking_ps = stall_metrics_.last_blocking_ps_hash.load(std::memory_order_relaxed);
+  const uint32_t total_session =
+      stall_metrics_.total_misses_session.load(std::memory_order_relaxed);
+
+  // Render path string for the human reader.
+  const char* render_path =
+      render_target_cache_.GetPath() == ::rex::graphics::RenderTargetCache::Path::kPixelShaderInterlock
+          ? "ROV"
+          : "RTV";
+
+  // Snapshot the last blocking description (RT format / depth / blend).
+  PipelineDescription desc{};
+  bool desc_valid = false;
+  {
+    std::lock_guard<std::mutex> lock(last_blocking_description_mutex_);
+    if (last_blocking_description_valid_) {
+      desc = last_blocking_description_;
+      desc_valid = true;
+    }
+  }
+
+  // Build the RT[0]/depth summary if we have a description. The full
+  // PipelineDescription is XXH3'd to produce blocking_pso_hash so a single
+  // hex line is enough to identify the PSO for a prewarm pass, but a few
+  // human-readable fields help spot patterns (e.g. all spikes hit on a
+  // particular RT format).
+  uint32_t rt0_format = 0;
+  uint32_t rt0_used = 0;
+  uint32_t depth_format = 0;
+  uint32_t depth_func = 0;
+  uint32_t depth_write = 0;
+  uint32_t stencil_enable = 0;
+  uint32_t msaa_samples = 0;
+  uint32_t cull_mode = 0;
+  if (desc_valid) {
+    rt0_format = static_cast<uint32_t>(desc.render_targets[0].format);
+    rt0_used = desc.render_targets[0].used;
+    depth_format = static_cast<uint32_t>(desc.depth_format);
+    depth_func = static_cast<uint32_t>(desc.depth_func);
+    depth_write = desc.depth_write;
+    stencil_enable = desc.stencil_enable;
+    msaa_samples = static_cast<uint32_t>(desc.host_msaa_samples);
+    cull_mode = static_cast<uint32_t>(desc.cull_mode);
+  }
+
+  // The "blocking_compile" flag answers the headline question: did the
+  // render thread spend non-trivial wall-clock on a synchronous compile this
+  // frame? Anything > 1 ms is a stall by 60 FPS budget standards.
+  const bool blocking_compile = sync_compile_ms > 1.0 || translate_ms > 1.0 || block_wait_ms > 1.0;
+
+  // Read the current PSO-missing policy for the log line (skip/block/sync).
+  const auto& policy_cvar = REXCVAR_GET(pso_missing_policy);
+  const char* policy_label = "skip";
+  if (policy_cvar == "block") {
+    policy_label = "block";
+  } else if (policy_cvar == "sync") {
+    policy_label = "sync";
+  }
+
+  const char* label =
+      severity ? severity
+               : (log_for_skipped ? "skipped-draws"
+                                  : (log_for_block ? "blocked"
+                                                   : (log_for_guest_cpu ? "guest-cpu-stall"
+                                                                        : (log_for_submit || log_for_present
+                                                                               ? "submit-present"
+                                                                               : "compile-only"))));
+
+  // Epic-style PSO precache validation label (Hit/Missed/Too-late terminology
+  // from the docx analysis): classify each miss according to whether it
+  // happened during the warmup window or after it. Pre-warmup misses are
+  // expected (cold cache loading); post-warmup misses that ALSO produced a
+  // user-visible spike are "TOO-LATE" — we should have precompiled them
+  // during the shader compile dialog but didn't. Pure POST-WARMUP-MISS (no
+  // spike severity) is benign — the PSO is being lazily fetched in the
+  // background and the user didn't notice.
+  auto& shader_progress = command_processor_.graphics_system()->shader_storage_progress();
+  const bool warmup_in_progress = shader_progress.in_progress.load(std::memory_order_relaxed);
+  const bool warmup_finished = shader_progress.finished.load(std::memory_order_relaxed);
+  const char* validation_label = "hit";
+  if (misses > 0) {
+    if (warmup_in_progress || !warmup_finished) {
+      validation_label = "startup-miss";
+    } else if (severity != nullptr) {
+      validation_label = "too-late";
+    } else {
+      validation_label = "post-warmup-miss";
+    }
+  }
+  const uint32_t spike_idx = spike_frame_counter_.fetch_add(1, std::memory_order_relaxed) + 1;
+  REXGPU_WARN(
+      "PSO_STALL[{}] #{} validation={} frame_ms={:.2f} render_path={} pso_missing_policy={} "
+      "pso_misses={} vs_translate_ms={:.2f} ps_translate_ms={:.2f} "
+      "sync_compile_ms={:.2f} async_compile_ms={:.2f} async_completions={} "
+      "draws_skipped_awaiting_pso={} block_wait_ms={:.2f} blocks={} "
+      "submit_ms={:.2f} present_ms={:.2f} "
+      "tex_req_ms={:.2f} tex_req_calls={} "
+      "rt_resolve_ms={:.2f} rt_resolve_count={} "
+      "submit_barriers_ms={:.2f} submit_barriers_calls={} "
+      "fence_wait_ms={:.2f} fence_waits={} "
+      "fence_wait_qops_ms={:.2f} fence_wait_qops={} "
+      "fence_wait_submission_ms={:.2f} fence_wait_submission={} "
+      "guest_cpu_io_ms={:.2f} guest_cpu_io_calls={} "
+      "guest_cpu_alloc_ms={:.2f} guest_cpu_alloc_calls={} "
+      "guest_cpu_wait_ms={:.2f} guest_cpu_wait_count={} "
+      "guest_cpu_total_ms={:.2f} "
+      "unaccounted_ms={:.2f} "
+      "blocking_on_render_thread_ms={:.2f} blocking_compile={} "
+      "blocking_pso_hash=0x{:016x} vs_hash=0x{:016x} ps_hash=0x{:016x} "
+      "rt0_used={} rt0_format={} depth_format={} depth_func={} depth_write={} "
+      "stencil_enable={} msaa_samples={} cull_mode={} "
+      "session_total_misses={}",
+      label, spike_idx, validation_label, frame_ms, render_path, policy_label, misses,
+      vs_translate_ms, ps_translate_ms, sync_compile_ms, async_compile_ms, async_completions,
+      draws_skipped, block_wait_ms, blocks, submit_ms, present_ms,
+      tex_req_ms, tex_req_calls,
+      rt_resolve_ms, rt_resolve_count,
+      submit_barriers_ms, submit_barriers_calls,
+      fence_wait_ms, fence_waits,
+      fence_wait_qops_ms, fence_wait_qops_count,
+      fence_wait_submission_ms, fence_wait_submission_count,
+      guest_io_ms, guest_io_calls,
+      guest_alloc_ms, guest_alloc_calls,
+      guest_wait_ms, guest_wait_count,
+      guest_cpu_total_ms,
+      unaccounted_ms,
+      blocking_ms,
+      blocking_compile ? "yes" : "no", blocking_pso, blocking_vs, blocking_ps, rt0_used,
+      rt0_format, depth_format, depth_func, depth_write, stencil_enable, msaa_samples, cull_mode,
+      total_session);
 }
 
 D3D12Shader* PipelineCache::LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
@@ -951,6 +1819,12 @@ bool PipelineCache::ConfigurePipeline(
 
   bool use_async = REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty() &&
                    pixel_shader != nullptr;
+  // pso_missing_policy == "sync" forces synchronous compile path regardless
+  // of the async_shader_compilation default, so the render thread blocks
+  // directly on CreateD3D12Pipeline. Used as a control test.
+  if (use_async && REXCVAR_GET(pso_missing_policy) == "sync") {
+    use_async = false;
+  }
 
   // Ensure shaders are translated - needed now for GetCurrentStateDescription.
   // Edge flags are not supported yet (because polygon primitives are not).
@@ -968,8 +1842,15 @@ bool PipelineCache::ConfigurePipeline(
   if (!vertex_shader->is_translated() && !use_async) {
     std::lock_guard<std::mutex> lock(translation_request_lock_);
     if (!vertex_shader->is_translated()) {
-      if (!TranslateAnalyzedShader(*shader_translator_, *vertex_shader, dxbc_converter_, dxc_utils_,
-                                   dxc_compiler_)) {
+      auto translate_start = std::chrono::steady_clock::now();
+      bool translate_ok = TranslateAnalyzedShader(*shader_translator_, *vertex_shader,
+                                                  dxbc_converter_, dxc_utils_, dxc_compiler_);
+      stall_metrics_.frame_vs_translate_ns.fetch_add(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - translate_start)
+              .count(),
+          std::memory_order_relaxed);
+      if (!translate_ok) {
         REXGPU_ERROR("Failed to translate the vertex shader!");
         return false;
       }
@@ -995,8 +1876,15 @@ bool PipelineCache::ConfigurePipeline(
       std::lock_guard<std::mutex> lock(translation_request_lock_);
       if (!pixel_shader->is_translated()) {
         pixel_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
-        if (!TranslateAnalyzedShader(*shader_translator_, *pixel_shader, dxbc_converter_,
-                                     dxc_utils_, dxc_compiler_)) {
+        auto translate_start = std::chrono::steady_clock::now();
+        bool translate_ok = TranslateAnalyzedShader(*shader_translator_, *pixel_shader,
+                                                    dxbc_converter_, dxc_utils_, dxc_compiler_);
+        stall_metrics_.frame_ps_translate_ns.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - translate_start)
+                .count(),
+            std::memory_order_relaxed);
+        if (!translate_ok) {
           REXGPU_ERROR("Failed to translate the pixel shader!");
           return false;
         }
@@ -1029,6 +1917,10 @@ bool PipelineCache::ConfigurePipeline(
 
   if (current_pipeline_ != nullptr && !std::memcmp(&current_pipeline_->description.description,
                                                    &description, sizeof(description))) {
+    // Same-pipeline fast path: still update usage_count for accurate summary.
+    current_pipeline_->metadata.usage_count.fetch_add(1, std::memory_order_relaxed);
+    current_pipeline_->metadata.last_frame.store(
+        session_frame_counter_.load(std::memory_order_relaxed), std::memory_order_relaxed);
     *pipeline_handle_out = current_pipeline_;
     *root_signature_out = current_pipeline_->root_signature.load(std::memory_order_acquire);
     return true;
@@ -1041,6 +1933,10 @@ bool PipelineCache::ConfigurePipeline(
     Pipeline* found_pipeline = it->second;
     if (!std::memcmp(&found_pipeline->description.description, &description, sizeof(description))) {
       PROFILE_PIPELINE_CACHE_HIT();
+      // Live usage tracking for the end-of-session summary + capture file.
+      found_pipeline->metadata.usage_count.fetch_add(1, std::memory_order_relaxed);
+      found_pipeline->metadata.last_frame.store(
+          session_frame_counter_.load(std::memory_order_relaxed), std::memory_order_relaxed);
       current_pipeline_ = found_pipeline;
       *pipeline_handle_out = found_pipeline;
       *root_signature_out = found_pipeline->root_signature.load(std::memory_order_acquire);
@@ -1049,9 +1945,49 @@ bool PipelineCache::ConfigurePipeline(
   }
   PROFILE_PIPELINE_CACHE_MISS();
 
+  // Count the miss BEFORE branching into sync vs async so the per-frame log
+  // reflects all cache misses, not only the rare synchronous ones (Windows
+  // default has async_shader_compilation = true → almost all misses take the
+  // async branch and would otherwise be invisible).
+  stall_metrics_.frame_misses.fetch_add(1, std::memory_order_relaxed);
+  stall_metrics_.total_misses_session.fetch_add(1, std::memory_order_relaxed);
+  PsoCompileIndicatorStateRef().total_misses_session.fetch_add(1, std::memory_order_relaxed);
+  stall_metrics_.last_blocking_pso_hash.store(hash, std::memory_order_relaxed);
+  stall_metrics_.last_blocking_vs_hash.store(description.vertex_shader_hash,
+                                             std::memory_order_relaxed);
+  stall_metrics_.last_blocking_ps_hash.store(description.pixel_shader_hash,
+                                             std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(last_blocking_description_mutex_);
+    last_blocking_description_ = description;
+    last_blocking_description_valid_ = true;
+  }
+
   Pipeline* new_pipeline = new Pipeline;
   std::memcpy(&new_pipeline->description, &runtime_description, sizeof(runtime_description));
   new_pipeline->root_signature.store(runtime_description.root_signature, std::memory_order_release);
+  new_pipeline->metadata.origin = PipelineOrigin::kRuntimeMiss;
+  new_pipeline->metadata.caused_runtime_miss = true;
+  new_pipeline->metadata.first_frame.store(session_frame_counter_.load(std::memory_order_relaxed),
+                                           std::memory_order_relaxed);
+  session_runtime_misses_.fetch_add(1, std::memory_order_relaxed);
+  session_new_keys_captured_.fetch_add(1, std::memory_order_relaxed);
+  if (REXCVAR_GET(pso_capture)) {
+    // Demoted from WARN → INFO 2026-06-22: at log_level=warn this fires for
+    // every new PSO and floods the trace overlay during normal gameplay. The
+    // capture sidecar (.xpso.capture.toml on shutdown) still records every
+    // key — only the per-miss WARN line goes away.
+    REXGPU_INFO(
+        "PSO_CAPTURE: new key hash=0x{:016X} vs=0x{:016X} ps=0x{:016X} "
+        "rt0_used={} rt0_format={} depth_format={} depth_func={} depth_write={} "
+        "msaa_samples={} cull_mode={} frame={}",
+        hash, description.vertex_shader_hash, description.pixel_shader_hash,
+        uint32_t(description.render_targets[0].used),
+        uint32_t(description.render_targets[0].format), uint32_t(description.depth_format),
+        uint32_t(description.depth_func), uint32_t(description.depth_write),
+        uint32_t(description.host_msaa_samples), uint32_t(description.cull_mode),
+        session_frame_counter_.load(std::memory_order_relaxed));
+  }
   pipelines_.emplace(hash, new_pipeline);
   COUNT_profile_set("gpu/pipeline_cache/pipelines", pipelines_.size());
 
@@ -1070,10 +2006,32 @@ bool PipelineCache::ConfigurePipeline(
     {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
       creation_queue_.push(new_pipeline);
+      PsoCompileIndicatorStateRef().creation_queue_size.store(
+          uint32_t(creation_queue_.size()), std::memory_order_relaxed);
     }
     creation_request_cond_.notify_one();
   } else {
-    new_pipeline->state.store(CreateD3D12Pipeline(runtime_description), std::memory_order_release);
+    // Synchronous compilation on the command-processor thread — wall-clock
+    // here is the direct render-thread stall measurement.
+    auto compile_start = std::chrono::steady_clock::now();
+    ID3D12PipelineState* pipeline_state = CreateD3D12Pipeline(runtime_description);
+    auto compile_end = std::chrono::steady_clock::now();
+    uint64_t compile_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(compile_end - compile_start).count();
+    new_pipeline->state.store(pipeline_state, std::memory_order_release);
+    stall_metrics_.frame_sync_compile_ns.fetch_add(compile_ns, std::memory_order_relaxed);
+    // Mirror to the cross-module indicator state so the overlay can show a
+    // post-stall flash for sync mode (otherwise it stays empty under
+    // pso_missing_policy='sync' because there's no async queue).
+    auto& indicator = PsoCompileIndicatorStateRef();
+    indicator.sync_compiles_session.fetch_add(1, std::memory_order_relaxed);
+    indicator.last_sync_compile_steady_ns.store(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(compile_end.time_since_epoch()).count(),
+        std::memory_order_relaxed);
+    float compile_ms = static_cast<float>(static_cast<double>(compile_ns) / 1.0e6);
+    uint32_t bits;
+    std::memcpy(&bits, &compile_ms, sizeof(bits));
+    indicator.last_sync_compile_duration_ms_bits.store(bits, std::memory_order_relaxed);
   }
 
   if (pipeline_storage_file_) {
@@ -3068,17 +4026,61 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
 
   // Create the D3D12 pipeline state object.
   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
-  ID3D12PipelineState* state;
-  if (FAILED(device->CreateGraphicsPipelineState(&state_desc, IID_PPV_ARGS(&state)))) {
-    if (runtime_description.pixel_shader != nullptr) {
-      REXGPU_ERROR("Failed to create graphics pipeline with VS {:016X}, PS {:016X}",
-                   runtime_description.vertex_shader->shader().ucode_data_hash(),
-                   runtime_description.pixel_shader->shader().ucode_data_hash());
+  ID3D12PipelineState* state = nullptr;
+
+  // Compute a unique LPCWSTR name for this PSO from the description hash so
+  // ID3D12PipelineLibrary can key it. Same hash the .xpso file uses.
+  const uint64_t pipeline_name_hash =
+      XXH3_64bits(&description, sizeof(description));
+  wchar_t pipeline_name[17];
+  swprintf_s(pipeline_name, L"%016llX", static_cast<unsigned long long>(pipeline_name_hash));
+
+  // Fast path: try LoadGraphicsPipeline from the persistent library. A hit
+  // returns a fully compiled PSO in microseconds and skips the slow driver
+  // compile entirely. ID3D12PipelineLibrary methods are not thread-safe per
+  // spec, so all calls share pipeline_library_mutex_ - but Load is fast, so
+  // contention is minimal even with multiple creation threads.
+  if (pipeline_library_) {
+    std::lock_guard<std::mutex> lock(pipeline_library_mutex_);
+    HRESULT hr_load = pipeline_library_->LoadGraphicsPipeline(
+        pipeline_name, &state_desc, IID_PPV_ARGS(&state));
+    if (SUCCEEDED(hr_load)) {
+      pipeline_library_load_hits_.fetch_add(1, std::memory_order_relaxed);
     } else {
-      REXGPU_ERROR("Failed to create graphics pipeline with VS {:016X}",
-                   runtime_description.vertex_shader->shader().ucode_data_hash());
+      state = nullptr;
     }
-    return nullptr;
+  }
+
+  if (!state) {
+    // Slow path: full driver compile. Stays OUTSIDE the library mutex so the
+    // parallel creation thread pool retains its parallelism on cold boot.
+    if (FAILED(device->CreateGraphicsPipelineState(&state_desc, IID_PPV_ARGS(&state)))) {
+      if (runtime_description.pixel_shader != nullptr) {
+        REXGPU_ERROR("Failed to create graphics pipeline with VS {:016X}, PS {:016X}",
+                     runtime_description.vertex_shader->shader().ucode_data_hash(),
+                     runtime_description.pixel_shader->shader().ucode_data_hash());
+      } else {
+        REXGPU_ERROR("Failed to create graphics pipeline with VS {:016X}",
+                     runtime_description.vertex_shader->shader().ucode_data_hash());
+      }
+      return nullptr;
+    }
+    // Insert the freshly-compiled PSO into the library so the next boot can
+    // skip the compile. Brief lock; just stamps a name into the in-memory
+    // library tree. E_INVALIDARG (duplicate name from a parallel store) and
+    // similar non-fatal returns are silently tallied.
+    if (pipeline_library_) {
+      std::lock_guard<std::mutex> lock(pipeline_library_mutex_);
+      HRESULT hr_store = pipeline_library_->StorePipeline(pipeline_name, state);
+      if (SUCCEEDED(hr_store)) {
+        pipeline_library_store_count_.fetch_add(1, std::memory_order_relaxed);
+        pipeline_library_dirty_.store(true, std::memory_order_relaxed);
+        PsoCompileIndicatorStateRef().library_stores_session.fetch_add(
+            1, std::memory_order_relaxed);
+      } else {
+        pipeline_library_store_failures_.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
   }
   std::u16string name;
   if (runtime_description.pixel_shader != nullptr) {
@@ -3263,14 +4265,27 @@ void PipelineCache::CreationThread(size_t thread_index) {
       pipeline_to_create = creation_queue_.top();
       creation_queue_.pop();
       ++creation_threads_busy_;
+      // Mirror to the cross-module indicator state. queue_size lags by one
+      // until the lock is released, but the indicator polls at ImGui frame
+      // cadence, so that's well below visible resolution.
+      PsoCompileIndicatorStateRef().creation_queue_size.store(
+          uint32_t(creation_queue_.size()), std::memory_order_relaxed);
+      PsoCompileIndicatorStateRef().creation_threads_busy.store(
+          uint32_t(creation_threads_busy_), std::memory_order_relaxed);
     }
 
     PipelineRuntimeDescription runtime_description;
     if (!PrepareRuntimeDescriptionForQueuedCreation(pipeline_to_create, runtime_description)) {
       pipeline_to_create->state.store(nullptr, std::memory_order_release);
     } else {
-      pipeline_to_create->state.store(CreateD3D12Pipeline(runtime_description),
-                                      std::memory_order_release);
+      auto compile_start = std::chrono::steady_clock::now();
+      ID3D12PipelineState* pipeline_state = CreateD3D12Pipeline(runtime_description);
+      uint64_t compile_ns =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - compile_start)
+              .count();
+      pipeline_to_create->state.store(pipeline_state, std::memory_order_release);
+      NoteAsyncCompile(compile_ns, runtime_description);
     }
     {
       // Progress bump is gated by the storage-init flag so runtime pipeline
@@ -3281,12 +4296,27 @@ void PipelineCache::CreationThread(size_t thread_index) {
       }
     }
 
+    // Indicator: mark this completion. Drives the "auto-hide N seconds after
+    // last completion" timer in the overlay so a single mid-frame compile
+    // gets a visible flash instead of disappearing instantly.
+    {
+      auto& ind = PsoCompileIndicatorStateRef();
+      ind.total_completions_session.fetch_add(1, std::memory_order_relaxed);
+      ind.last_completion_steady_ns.store(
+          uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch())
+                       .count()),
+          std::memory_order_relaxed);
+    }
+
     // Pipeline created - the thread is not busy anymore, safe to set the
     // completion event if needed (at the next iteration, or in some other
     // thread).
     {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
       --creation_threads_busy_;
+      PsoCompileIndicatorStateRef().creation_threads_busy.store(
+          uint32_t(creation_threads_busy_), std::memory_order_relaxed);
     }
   }
 }
@@ -3310,12 +4340,110 @@ void PipelineCache::CreateQueuedPipelinesOnProcessorThread() {
       pipeline_to_create->state.store(nullptr, std::memory_order_release);
       continue;
     }
-    pipeline_to_create->state.store(CreateD3D12Pipeline(runtime_description),
-                                    std::memory_order_release);
+    auto compile_start = std::chrono::steady_clock::now();
+    ID3D12PipelineState* pipeline_state = CreateD3D12Pipeline(runtime_description);
+    uint64_t compile_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - compile_start)
+            .count();
+    pipeline_to_create->state.store(pipeline_state, std::memory_order_release);
+    NoteAsyncCompile(compile_ns, runtime_description);
     if (tracking) {
       progress.pipelines_created.fetch_add(1, std::memory_order_relaxed);
     }
   }
 }
 
+void PipelineCache::NoteAsyncCompile(uint64_t compile_ns,
+                                     const PipelineRuntimeDescription& runtime_description) {
+  stall_metrics_.frame_async_compile_ns.fetch_add(compile_ns, std::memory_order_relaxed);
+  stall_metrics_.frame_async_completions.fetch_add(1, std::memory_order_relaxed);
+  // Also update last_blocking_description_ so the per-frame log can show what
+  // recently finished compiling, useful when the spike is caused by the
+  // command processor skipping draws while waiting on this PSO.
+  std::lock_guard<std::mutex> lock(last_blocking_description_mutex_);
+  last_blocking_description_ = runtime_description.description;
+  last_blocking_description_valid_ = true;
+}
+
+void PipelineCache::NoteDrawSkippedAwaitingAsyncPipeline() {
+  stall_metrics_.frame_draws_skipped.fetch_add(1, std::memory_order_relaxed);
+}
+
+void PipelineCache::NoteRenderThreadBlockedOnAsyncPipeline(uint64_t wait_ns) {
+  stall_metrics_.frame_block_wait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
+  stall_metrics_.frame_blocks.fetch_add(1, std::memory_order_relaxed);
+}
+
+void PipelineCache::NoteSubmitNs(uint64_t submit_ns) {
+  stall_metrics_.frame_submit_ns.fetch_add(submit_ns, std::memory_order_relaxed);
+}
+
+void PipelineCache::NotePresentNs(uint64_t present_ns) {
+  stall_metrics_.frame_present_ns.fetch_add(present_ns, std::memory_order_relaxed);
+}
+
+void PipelineCache::NoteTextureRequestNs(uint64_t ns) {
+  stall_metrics_.frame_texture_request_ns.fetch_add(ns, std::memory_order_relaxed);
+  stall_metrics_.frame_texture_request_calls.fetch_add(1, std::memory_order_relaxed);
+}
+
+void PipelineCache::NoteRtResolveNs(uint64_t ns) {
+  stall_metrics_.frame_rt_resolve_ns.fetch_add(ns, std::memory_order_relaxed);
+  stall_metrics_.frame_rt_resolve_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void PipelineCache::NoteSubmitBarriersNs(uint64_t ns) {
+  stall_metrics_.frame_submit_barriers_ns.fetch_add(ns, std::memory_order_relaxed);
+  stall_metrics_.frame_submit_barriers_calls.fetch_add(1, std::memory_order_relaxed);
+}
+
+void PipelineCache::NoteFenceWaitNs(uint64_t ns) {
+  stall_metrics_.frame_fence_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+  stall_metrics_.frame_fence_waits.fetch_add(1, std::memory_order_relaxed);
+}
+
+void PipelineCache::NoteFenceWaitQueueOpsNs(uint64_t ns) {
+  stall_metrics_.frame_fence_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+  stall_metrics_.frame_fence_waits.fetch_add(1, std::memory_order_relaxed);
+  stall_metrics_.frame_fence_wait_qops_ns.fetch_add(ns, std::memory_order_relaxed);
+  stall_metrics_.frame_fence_wait_qops_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void PipelineCache::NoteFenceWaitSubmissionNs(uint64_t ns) {
+  stall_metrics_.frame_fence_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+  stall_metrics_.frame_fence_waits.fetch_add(1, std::memory_order_relaxed);
+  stall_metrics_.frame_fence_wait_submission_ns.fetch_add(ns, std::memory_order_relaxed);
+  stall_metrics_.frame_fence_wait_submission_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::atomic<uint64_t>& PsoStallPresentNsAccumulator() {
+  // Function-static to avoid the static-initialization-order fiasco. Defined
+  // here (alongside PipelineCache, which is the sole reader) rather than in
+  // d3d12_presenter.cpp so the writer side links cleanly without circular
+  // dependency on the rexgraphics target.
+  static std::atomic<uint64_t> accumulator{0};
+  return accumulator;
+}
+
+PsoCompileIndicatorState& PsoCompileIndicatorStateRef() {
+  // Function-static for the same reason as PsoStallPresentNsAccumulator
+  // above. Read by PsoCompileIndicatorDialog in rexui; written from
+  // PipelineCache's queue/busy/completion code paths.
+  static PsoCompileIndicatorState state;
+  return state;
+}
+
 }  // namespace rex::graphics::d3d12
+
+namespace rex::perf {
+
+GuestCpuStallMetrics& GuestCpuStallMetricsRef() {
+  // Same function-static cross-module pattern. Writers: kernel TUs that
+  // wrap NtCreate/Read/Write/Close, RtlAllocateHeap and friends, and the
+  // NtWaitForSingleObject path. Reader/drainer: PipelineCache::ReportFrameBoundary.
+  static GuestCpuStallMetrics metrics;
+  return metrics;
+}
+
+}  // namespace rex::perf

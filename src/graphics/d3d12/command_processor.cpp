@@ -14,6 +14,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
+#include <thread>
 #include <utility>
 
 #include <rex/assert.h>
@@ -34,6 +35,10 @@
 #include <rex/system/kernel_state.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+
+// Defined in pipeline_cache.cpp. Forward-declare here so REXCVAR_GET resolves
+// in command_processor.cpp (used inside the 'block' policy per-draw wait).
+REXCVAR_DECLARE(double, d3d12_pso_block_per_draw_budget_ms);
 
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -72,11 +77,36 @@ REXCVAR_DEFINE_INT32(skate3_ultrawide_fake_occlusion_sample_count, 1000, "Skate 
     .range(1, 1000000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Skate 3's UE3 build calls XUserSetContext(X_CONTEXT_GAME_MODE, 1) when
+// gameplay begins, which gates the "fast" scaled-resolve path that PRESERVES
+// the scaled buffer (vs the readback path that point-samples 2560x1440 -> 1280x720).
+// UE3 cooks that DON'T set this context (e.g., Silent Hill: Downpour) lose all
+// SSAA detail to the readback downsample. This cvar forces gameplay-state-active
+// regardless of the kernel rich-presence value, so titles that never set the
+// X_CONTEXT_GAME_MODE context can still benefit from resolution_scale > 1.
+REXCVAR_DEFINE_BOOL(force_gameplay_state_active, false, "GPU",
+                    "Force IsGameplayStateActive() to return true. Required for UE3 cooks "
+                    "that don't call XUserSetContext(X_CONTEXT_GAME_MODE, 1). Without this, "
+                    "scaled resolves get downsampled to 1x via the readback path, throwing "
+                    "away all SSAA detail.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// Diagnostic: log RT/resolve/swap dimensions so we can see where the scaled
+// chain leaks back to unscaled. Spammy but only fires once per unique RT
+// allocation / resolve burst when log_level=info.
+REXCVAR_DEFINE_BOOL(log_scale_chain, false, "GPU/D3D12",
+                    "Log RT create / resolve / swap dimensions with both logical and physical "
+                    "sizes so the scaled-chain leak (physical -> logical) can be located.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::d3d12 {
 
 namespace {
 
 bool IsGameplayStateActive(const system::KernelState* kernel_state) {
+  if (REXCVAR_GET(force_gameplay_state_active)) {
+    return true;
+  }
   if (!kernel_state) {
     return false;
   }
@@ -575,8 +605,19 @@ void D3D12CommandProcessor::SubmitBarriers() {
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
     PERF_counter_add(kD3D12BarriersSubmitted, barrier_count);
 #endif
+    // Non-PSO spike attribution (Etap 2): time recorded into D3D resource
+    // barrier records on the deferred command list. Cheap unless the list
+    // grows large; high values indicate barrier thrash (e.g. transitioning
+    // a single resource between many states inside one frame).
+    auto barrier_start = std::chrono::steady_clock::now();
     deferred_command_list_.D3DResourceBarrier(barrier_count, barriers_.data());
     barriers_.clear();
+    if (pipeline_cache_) {
+      pipeline_cache_->NoteSubmitBarriersNs(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - barrier_start)
+              .count());
+    }
   }
 }
 
@@ -1966,7 +2007,7 @@ void D3D12CommandProcessor::ShutdownContext() {
   readback_buffer_size_ = 0;
   for (auto& resolve_readback_pair : readback_buffers_) {
     auto& readback = resolve_readback_pair.second;
-    for (uint32_t i = 0; i < 2; ++i) {
+    for (uint32_t i = 0; i < kReadbackBufferSlots; ++i) {
       if (readback.buffers[i]) {
         if (readback.mapped_data[i]) {
           readback.buffers[i]->Unmap(0, nullptr);
@@ -1983,7 +2024,7 @@ void D3D12CommandProcessor::ShutdownContext() {
   readback_buffers_.clear();
   for (auto& memexport_readback_pair : memexport_readback_buffers_) {
     auto& readback = memexport_readback_pair.second;
-    for (uint32_t i = 0; i < 2; ++i) {
+    for (uint32_t i = 0; i < kReadbackBufferSlots; ++i) {
       if (readback.buffers[i]) {
         if (readback.mapped_data[i]) {
           readback.buffers[i]->Unmap(0, nullptr);
@@ -2308,6 +2349,21 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           "unscaled ({}x{}). This title may be presenting from an unscaled "
           "resolve path.",
           guest_output_width, guest_output_height);
+    }
+  }
+  if (REXCVAR_GET(log_scale_chain)) {
+    static uint32_t swap_log_counter = 0;
+    if ((swap_log_counter++ & 0x3F) == 0) {
+      REXGPU_WARN(
+          "SWAP: guest_output={}x{} source_physical={}x{} frontbuffer_unscaled={}x{} "
+          "swap_source_scaled={} gameplay_state_active={} scale={}x{}",
+          guest_output_width, guest_output_height,
+          source_width_scaled, source_height_scaled,
+          frontbuffer_width_unscaled, frontbuffer_height_unscaled,
+          swap_source_scaled,
+          IsGameplayStateActive(kernel_state_),
+          texture_cache_->draw_resolution_scale_x(),
+          texture_cache_->draw_resolution_scale_y());
     }
   }
 
@@ -2758,7 +2814,43 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
     if (REXCVAR_GET(async_shader_compilation) &&
         pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
-      return true;
+      // PSO not finished compiling yet on a background thread. Behavior is
+      // selected by the `pso_missing_policy` cvar — see its declaration in
+      // pipeline_cache.cpp for semantics.
+      const auto& policy = REXCVAR_GET(pso_missing_policy);
+      if (policy == "block") {
+        // Spin-wait until the background creation thread completes the PSO
+        // OR the per-draw budget expires (cvar d3d12_pso_block_per_draw_budget_ms,
+        // default 8 ms = half a 60Hz frame). On timeout: skip the draw —
+        // single-frame missing geometry is far less visible than a multi-
+        // frame freeze. 2026-06-22: cut hardcoded 500ms valve down to a
+        // tunable knob after user reported per-PSO 850ms render-thread
+        // freezes from a single expensive ROV compile.
+        const double budget_ms = REXCVAR_GET(d3d12_pso_block_per_draw_budget_ms);
+        const auto budget = std::chrono::microseconds(
+            static_cast<int64_t>(budget_ms * 1000.0));
+        auto wait_start = std::chrono::steady_clock::now();
+        while (pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
+          std::this_thread::sleep_for(std::chrono::microseconds(50));
+          if (std::chrono::steady_clock::now() - wait_start > budget) {
+            pipeline_cache_->NoteRenderThreadBlockedOnAsyncPipeline(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - wait_start)
+                    .count());
+            pipeline_cache_->NoteDrawSkippedAwaitingAsyncPipeline();
+            return true;
+          }
+        }
+        pipeline_cache_->NoteRenderThreadBlockedOnAsyncPipeline(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - wait_start)
+                .count());
+        // Fall through to the normal draw path with the now-ready PSO.
+      } else {
+        // Default "skip" — drop the draw silently this frame.
+        pipeline_cache_->NoteDrawSkippedAwaitingAsyncPipeline();
+        return true;
+      }
     }
   }
 
@@ -2768,7 +2860,16 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
   {
     REX_D3D12_DRAW_STAGE_TIMER(kDrawStageTextureUs);
+    // Non-PSO spike attribution (Etap 2): time spent in texture binding +
+    // upload work. The user's 300ms+ spikes after a warm PSO cache often
+    // correlate with new textures streaming in; this counter splits texture
+    // work from "everything else" so we can target the right fix.
+    auto tex_start = std::chrono::steady_clock::now();
     texture_cache_->RequestTextures(used_texture_mask);
+    pipeline_cache_->NoteTextureRequestNs(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - tex_start)
+            .count());
   }
 
   // Bind the pipeline after configuring it and doing everything that may bind
@@ -3350,7 +3451,9 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
   };
 
   const uint32_t write_index = readback.current_index;
-  const uint32_t read_index = 1 - write_index;
+  // 3-slot ring: read from the slot that was written 2 frames ago, which on
+  // a healthy frame is guaranteed completed by the GPU.
+  const uint32_t read_index = (write_index + 1) % kReadbackBufferSlots;
   const uint32_t readback_size = AlignReadbackBufferSize(total_size);
   if (!ensure_readback_slot(write_index, readback_size)) {
     return IssueDraw_MemexportReadbackFullPath(total_size);
@@ -3370,15 +3473,46 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
   readback.written_size[write_index] = total_size;
 
   CheckSubmissionFence(0);
-  bool previous_slot_ready = readback.buffers[read_index] && readback.mapped_data[read_index] &&
-                             total_size <= readback.sizes[read_index] &&
-                             total_size <= readback.written_size[read_index] &&
-                             readback.submission_written[read_index] &&
-                             readback.submission_written[read_index] <= submission_completed_;
-  if (!previous_slot_ready) {
+  // Split "previous slot not ready" into two cases to avoid the per-draw
+  // pipeline drain that the original full-path fallback caused. The full
+  // path closes the current submission and AwaitAlls — when UE3 issues many
+  // memexport draws per frame this snowballs into 4-500+ fence_waits/frame
+  // (the entire Downpour stutter pattern documented in
+  // reference_downpour_fence_wait_texture_upload_stutter_2026-06-24.md).
+  //
+  // Case A — slot truly missing / wrong size / never written: TRUE first-time
+  //   fallback to full path. Happens once per memexport key per session.
+  //
+  //   2026-06-27 night had TWO failed attempts to skip this AwaitAll:
+  //     #1 (memset zero-init guest mem) — TDR ~11s in. Memset() races GPU
+  //         write to shared_memory at same addr → garbage indirect cmds.
+  //     #2 (skip entirely, don't touch guest mem) — TDR after ~few minutes.
+  //         Guest PPC code READS from guest mem and feeds values into
+  //         indirect draw counts, vertex buffer offsets, skinning matrices,
+  //         etc. Stale/uninit data → garbage GPU params → TDR.
+  //   Conclusion: the CPU MUST have valid memexport data after the draw —
+  //   the game depends on reading it. To eliminate the AwaitAll cascade
+  //   without breaking the game, the right fix is to BATCH all Case A first-
+  //   time keys in a frame into ONE end-of-frame AwaitAll instead of 37
+  //   sequential AwaitAlls. That's a multi-hour refactor; for now eat the
+  //   cost.
+  //
+  // Case B — slot exists but its submission hasn't completed yet: do a
+  //   TARGETED wait on that specific OLDER submission instead of full path.
+  //   We don't close the current submission; the GPU pipeline stays in flight.
+  //   The wait is for at most one previous frame's submission, which on a
+  //   healthy frame is almost always already complete — fence_wait_ms ~= 0.
+  const bool slot_exists = readback.buffers[read_index] && readback.mapped_data[read_index] &&
+                           total_size <= readback.sizes[read_index] &&
+                           total_size <= readback.written_size[read_index] &&
+                           readback.submission_written[read_index] != 0;
+  if (!slot_exists) {
     IssueDraw_MemexportReadbackFullPath(total_size);
     readback.current_index = read_index;
     return true;
+  }
+  if (readback.submission_written[read_index] > submission_completed_) {
+    CheckSubmissionFence(readback.submission_written[read_index]);
   }
 
   const uint8_t* readback_bytes = static_cast<const uint8_t*>(readback.mapped_data[read_index]);
@@ -3416,11 +3550,44 @@ bool D3D12CommandProcessor::IssueCopy() {
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
   PROFILE_SCOPE_COUNTER(kRtResolveUs);
+  // Non-PSO spike attribution (Etap 2): wall-clock spent in RT resolve work
+  // (the EDRAM-to-texture copy that fires on render-target switches +
+  // explicit Resolve commands). Common source of frame spikes on areas with
+  // many render-target ping-pongs (post-process, full-screen blur).
+  auto resolve_start = std::chrono::steady_clock::now();
+  auto note_resolve_on_exit = [&]() {
+    if (pipeline_cache_) {
+      pipeline_cache_->NoteRtResolveNs(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - resolve_start)
+              .count());
+    }
+  };
   if (!BeginSubmission(true)) {
+    note_resolve_on_exit();
     return false;
   }
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
   const bool gameplay_state_active = IsGameplayStateActive(kernel_state_);
+  if (REXCVAR_GET(log_scale_chain)) {
+    static uint32_t resolve_log_counter = 0;
+    static uint32_t resolve_fastpath = 0;
+    static uint32_t resolve_readbackpath = 0;
+    const bool will_take_fast =
+        readback_mode == ReadbackResolveMode::kDisabled &&
+        (!texture_cache_->IsDrawResolutionScaled() || gameplay_state_active);
+    if (will_take_fast) resolve_fastpath++; else resolve_readbackpath++;
+    if ((resolve_log_counter++ & 0xFF) == 0) {
+      REXGPU_WARN(
+          "RESOLVE_GATE: path={} fast_taken={} readback_taken={} (readback_mode={} "
+          "scaled={} gameplay_state_active={})",
+          will_take_fast ? "FAST(scaled-stays-scaled)" : "READBACK(downsample-to-1x)",
+          resolve_fastpath, resolve_readbackpath,
+          int(readback_mode),
+          texture_cache_->IsDrawResolutionScaled(),
+          gameplay_state_active);
+    }
+  }
   if (readback_mode == ReadbackResolveMode::kDisabled &&
       (!texture_cache_->IsDrawResolutionScaled() || gameplay_state_active)) {
     uint32_t written_address, written_length;
@@ -3431,9 +3598,12 @@ bool D3D12CommandProcessor::IssueCopy() {
     bool resolved = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
                                                   written_address, written_length);
     EndGpuTimestampedDraw(gpu_timestamp_query);
+    note_resolve_on_exit();
     return resolved;
   }
-  return IssueCopy_ReadbackResolvePath();
+  const bool fallback = IssueCopy_ReadbackResolvePath();
+  note_resolve_on_exit();
+  return fallback;
 }
 
 bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
@@ -3639,7 +3809,8 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome;
   uint32_t read_index = write_index;
   if (use_delayed_sync) {
-    read_index = 1 - write_index;
+    // 3-slot ring: read from slot written 2 frames ago.
+    read_index = (write_index + 1) % kReadbackBufferSlots;
   } else if (!AwaitAllQueueOperationsCompletion()) {
     return true;
   }
@@ -3663,7 +3834,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     }
   }
 
-  rb.current_index = 1 - rb.current_index;
+  rb.current_index = (rb.current_index + 1) % kReadbackBufferSlots;
   return true;
 }
 
@@ -3689,11 +3860,18 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
             rex::perf::CounterId::kGpuThreadFenceWaitUs, true);
         const std::chrono::steady_clock::time_point wait_start = std::chrono::steady_clock::now();
         WaitForSingleObject(fence_completion_event_, INFINITE);
+        const uint64_t wait_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - wait_start)
+                .count();
         if (ui::Presenter* wait_presenter = graphics_system_->presenter()) {
-          wait_presenter->AddGuestFrameWaitMicroseconds(uint64_t(
-              std::chrono::duration_cast<std::chrono::microseconds>(
-                  std::chrono::steady_clock::now() - wait_start)
-                  .count()));
+          wait_presenter->AddGuestFrameWaitMicroseconds(wait_ns / 1000);
+        }
+        // Etap 2 non-PSO attribution: this CPU<->GPU fence wait is normally
+        // the bulk of "unaccounted_ms" on GPU-bound frames. Out-of-submission
+        // queue-ops sub-bucket — mostly tile-mapping updates.
+        if (pipeline_cache_) {
+          pipeline_cache_->NoteFenceWaitQueueOpsNs(wait_ns);
         }
         queue_operations_done_since_submission_signal_ = false;
       } else {
@@ -3720,11 +3898,21 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
       // blocked time in builds without perf counters.
       const std::chrono::steady_clock::time_point wait_start = std::chrono::steady_clock::now();
       WaitForSingleObject(fence_completion_event_, INFINITE);
+      const uint64_t wait_ns =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - wait_start)
+              .count();
       if (ui::Presenter* wait_presenter = graphics_system_->presenter()) {
-        wait_presenter->AddGuestFrameWaitMicroseconds(uint64_t(
-            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
-                                                                  wait_start)
-                .count()));
+        wait_presenter->AddGuestFrameWaitMicroseconds(wait_ns / 1000);
+      }
+      // Etap 2 non-PSO attribution: same as the out-of-submission wait above
+      // — this is the bulk of "unaccounted_ms" on GPU-bound frames.
+      // Submission-fence sub-bucket — covers BOTH end-of-frame and any
+      // explicit AwaitAllQueueOperationsCompletion mid-frame (e.g. memexport
+      // readback Case A). Spike fence storms (500+ fence_waits/frame) almost
+      // always flow through this path.
+      if (pipeline_cache_) {
+        pipeline_cache_->NoteFenceWaitSubmissionNs(wait_ns);
       }
       submission_completed_ = submission_fence_->GetCompletedValue();
     }
@@ -4014,6 +4202,28 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
 
       primitive_processor_->EndFrame();
     }
+
+    // PSO stall instrumentation: correlate the wall-clock duration of this
+    // frame with any synchronous PSO compile / shader translation work that
+    // happened on this thread since the last frame closure. See
+    // PipelineCache::ReportFrameBoundary for the spike-threshold logic.
+    // TODO(stall-probe): for tighter correlation move this closer to the
+    // actual Present/VBlank — this point is before SubmitBarriers / Execute,
+    // so we measure command-processor wall-clock, not full guest frame.
+    // Acceptable for the first proof pass (compile work is on this thread
+    // either way).
+    auto now = std::chrono::steady_clock::now();
+    if (pso_stall_last_frame_close_.time_since_epoch().count() != 0) {
+      uint64_t frame_ns =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(now - pso_stall_last_frame_close_)
+              .count();
+      pipeline_cache_->ReportFrameBoundary(frame_ns);
+    } else {
+      // First frame seen: drain the counters anyway so warmup-phase work
+      // doesn't bleed into the first measured frame.
+      pipeline_cache_->ReportFrameBoundary(0);
+    }
+    pso_stall_last_frame_close_ = now;
   }
 
   if (submission_open_) {
@@ -4059,7 +4269,12 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     ID3D12CommandList* execute_command_lists[] = {command_list_};
     {
       PROFILE_SCOPE_COUNTER(kCpuD3D12ExecuteCommandListsUs);
+      auto submit_start = std::chrono::steady_clock::now();
       direct_queue->ExecuteCommandLists(1, execute_command_lists);
+      pipeline_cache_->NoteSubmitNs(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - submit_start)
+              .count());
     }
     command_allocator_writable_first_->last_usage_submission = submission_current_;
     if (command_allocator_submitted_last_) {
@@ -5439,7 +5654,7 @@ void D3D12CommandProcessor::EvictOldReadbackBuffers(
       ++it;
       continue;
     }
-    for (uint32_t i = 0; i < 2; ++i) {
+    for (uint32_t i = 0; i < kReadbackBufferSlots; ++i) {
       if (readback.buffers[i]) {
         if (readback.mapped_data[i]) {
           readback.buffers[i]->Unmap(0, nullptr);

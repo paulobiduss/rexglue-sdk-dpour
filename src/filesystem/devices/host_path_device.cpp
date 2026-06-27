@@ -60,8 +60,25 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
     return resolved;
   }
 
-  // Fallback to a lazy case-insensitive host lookup when an entry is missing
-  // from the in-memory tree (for example because casing differs on Linux).
+  // Read-only fast path: the in-memory tree was fully populated at Initialize()
+  // by PopulateEntry, and Entry::GetChild is already case-insensitive. If a
+  // path didn't resolve through the tree on a read-only device, it cannot
+  // exist on disk either — the ListFiles fallback below would re-enumerate
+  // for nothing. Skipping it eliminates the 300-2000 ms frame stalls Downpour
+  // observed from UE3 probing non-existent files in CookedXenon/Binaries.
+  if (read_only_) {
+    return nullptr;
+  }
+
+  // Writable devices: fall back to a lazy case-insensitive host lookup when
+  // an entry is missing from the in-memory tree. Needed because new files
+  // may have been written since Initialize() so the tree could be stale.
+  //
+  // SECOND fast path (2026-06-22): even on a writable device, if the parent
+  // directory has zero children in memory AND PopulateEntry already ran at
+  // Initialize(), then ListFiles will return the same empty set — skip it.
+  // This kills the temp:\ probe stalls on \Device\Content\10 (an empty stub
+  // for save-backup paths the game checks but never writes).
   auto* current_entry = static_cast<HostPathEntry*>(root_entry_.get());
   for (const auto& part : rex::string::utf8_split_path(path)) {
     if (part.empty()) {
@@ -70,6 +87,12 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
 
     auto* child = current_entry->GetChild(part);
     if (!child) {
+      // Empty-directory fast path: if the parent has no children in memory
+      // and we are at the deepest resolved point, no on-disk listing will
+      // produce a match either.
+      if (current_entry->children().empty()) {
+        return nullptr;
+      }
       auto child_infos = rex::filesystem::ListFiles(current_entry->host_path());
       auto match = std::find_if(child_infos.begin(), child_infos.end(), [&](const auto& info) {
         return rex::string::utf8_equal_case(rex::path_to_utf8(info.name), part);

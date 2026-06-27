@@ -199,6 +199,10 @@ const char* ReadbackResolveModeName(ReadbackResolveMode mode) {
 }
 
 bool IsGameplayStateActive(const system::KernelState* kernel_state) {
+  // Same Downpour-style override as the D3D12 path. See command_processor.cpp:84.
+  if (rex::cvar::Query<bool>("force_gameplay_state_active")) {
+    return true;
+  }
   if (!kernel_state) {
     return false;
   }

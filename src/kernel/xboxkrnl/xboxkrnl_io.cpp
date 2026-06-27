@@ -17,6 +17,7 @@
 #include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/hook.h>
+#include <rex/perf/guest_cpu_stall_metrics.h>
 #include <rex/types.h>
 #include <rex/system/info/file.h>
 #include <rex/system/kernel_state.h>
@@ -105,6 +106,7 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
                        ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, mapped_u64 allocation_size_ptr,
                        u32 file_attributes, u32 share_access, u32 creation_disposition,
                        u32 create_options) {
+  rex::perf::ScopedGuestCpuTimer _guest_cpu_timer(rex::perf::GuestCpuBucket::kKernelIo);
   // note used. maybe later
   // uint64_t allocation_size = 0;  // is this correct???
   // if (allocation_size_ptr) {
@@ -187,6 +189,7 @@ u32 NtOpenFile_entry(mapped_u32 handle_out, u32 desired_access,
 u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_ptr,
                      mapped_void apc_context, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
                      mapped_void buffer, u32 buffer_length, mapped_u64 byte_offset_ptr) {
+  rex::perf::ScopedGuestCpuTimer _guest_cpu_timer(rex::perf::GuestCpuBucket::kKernelIo);
   uint64_t byte_offset = byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : 0;
   const bool apc_requested = (static_cast<uint32_t>(apc_routine_ptr) & ~1u) != 0;
   REXKRNL_IMPORT_TRACE(
@@ -299,6 +302,7 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
 u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_ptr,
                             mapped_void apc_context, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
                             mapped_u32 segment_array, u32 length, mapped_u64 byte_offset_ptr) {
+  rex::perf::ScopedGuestCpuTimer _guest_cpu_timer(rex::perf::GuestCpuBucket::kKernelIo);
   X_STATUS result = X_STATUS_SUCCESS;
 
   bool signal_event = false;
@@ -382,6 +386,7 @@ u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_r
 u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped_void apc_context,
                       ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, mapped_void buffer,
                       u32 buffer_length, mapped_u64 byte_offset_ptr) {
+  rex::perf::ScopedGuestCpuTimer _guest_cpu_timer(rex::perf::GuestCpuBucket::kKernelIo);
   X_STATUS result = X_STATUS_SUCCESS;
 
   // Grab event to signal.
@@ -515,6 +520,7 @@ u32 NtRemoveIoCompletion_entry(u32 handle, mapped_u32 key_context, mapped_u32 ap
 
 u32 NtQueryFullAttributesFile_entry(ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attribs,
                                     ppc_ptr_t<X_FILE_NETWORK_OPEN_INFORMATION> file_info) {
+  rex::perf::ScopedGuestCpuTimer _guest_cpu_timer(rex::perf::GuestCpuBucket::kKernelIo);
   auto object_name = REX_KERNEL_MEMORY()->TranslateVirtual<X_ANSI_STRING*>(obj_attribs->name_ptr);
   auto path_str = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), object_name);
   REXKRNL_IMPORT_TRACE("NtQueryFullAttributesFile", "path={}", path_str);
@@ -560,6 +566,7 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
                                ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
                                ppc_ptr_t<X_FILE_DIRECTORY_INFORMATION> file_info_ptr, u32 length,
                                ppc_ptr_t<X_ANSI_STRING> file_name, u32 restart_scan) {
+  rex::perf::ScopedGuestCpuTimer _guest_cpu_timer(rex::perf::GuestCpuBucket::kKernelIo);
   if (length < 72) {
     return X_STATUS_INFO_LENGTH_MISMATCH;
   }
@@ -598,6 +605,7 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
 }
 
 u32 NtFlushBuffersFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block_ptr) {
+  rex::perf::ScopedGuestCpuTimer _guest_cpu_timer(rex::perf::GuestCpuBucket::kKernelIo);
   auto result = X_STATUS_SUCCESS;
 
   if (io_status_block_ptr) {
@@ -677,6 +685,7 @@ u32 NtDeviceIoControlFile_entry(u32 handle, u32 event_handle, u32 apc_routine, u
                                 u32 io_status_block, u32 io_control_code, mapped_void input_buffer,
                                 u32 input_buffer_len, mapped_void output_buffer,
                                 u32 output_buffer_len) {
+  rex::perf::ScopedGuestCpuTimer _guest_cpu_timer(rex::perf::GuestCpuBucket::kKernelIo);
   // Called by XMountUtilityDrive cache-mounting code
   // (checks if the returned values look valid, values below seem to pass the
   // checks)

@@ -37,7 +37,65 @@ REXCVAR_DEFINE_INT32(d3d12_queue_priority, 1, "UI/D3D12",
                      "Graphics command queue priority (0=normal, 1=high, 2=realtime)")
     .range(0, 2);
 
+// Forward-declare the texture cache cvars we want to auto-tune at adapter
+// selection. The actual REXCVAR_DEFINE lives in graphics/pipeline/texture/cache.cpp;
+// REXCVAR_GET / REXCVAR_SET on the FLAGS_ storage accessor need a declaration
+// in scope, no header dependency required.
+REXCVAR_DECLARE(int32_t, texture_cache_memory_limit_soft);
+REXCVAR_DECLARE(int32_t, texture_cache_memory_limit_hard);
+
 namespace rex::ui::d3d12 {
+
+namespace {
+
+// VRAM tier table. Soft/hard pairs chosen to roughly match what we shipped
+// the v1.0 dist toml with (3072/6144 for an 8 GB GPU) and fan out from there.
+// "Soft" = preferred resident set; "hard" = upper bound where eviction kicks
+// in aggressively. Both in MB.
+struct TextureCacheTier {
+  uint64_t vram_mb_min;  // inclusive
+  int32_t  soft_mb;
+  int32_t  hard_mb;
+  const char* label;
+};
+constexpr TextureCacheTier kTextureCacheTiers[] = {
+    {   0, 1024, 2048, "low (<=3 GB VRAM)"     },
+    {3072, 1536, 3072, "entry (3-5 GB VRAM)"   },
+    {5120, 2048, 4096, "mid (5-7 GB VRAM)"     },
+    {7168, 3072, 6144, "high (7-10 GB VRAM)"   },
+    {10240, 4096, 8192, "enthusiast (>=10 GB VRAM)" },
+};
+
+void AutoTuneTextureCacheLimits(uint64_t dedicated_video_memory_bytes) {
+  const uint64_t vram_mb = dedicated_video_memory_bytes / (1024ull * 1024ull);
+  // Pick the highest tier whose threshold the GPU meets.
+  const TextureCacheTier* picked = &kTextureCacheTiers[0];
+  for (const auto& tier : kTextureCacheTiers) {
+    if (vram_mb >= tier.vram_mb_min) picked = &tier;
+  }
+  // Only override if the cvars are still at their SDK default values
+  // (2048/4096). A user with explicit values in toml will already have
+  // overwritten those — leave power-user setups alone.
+  const int32_t current_soft = REXCVAR_GET(texture_cache_memory_limit_soft);
+  const int32_t current_hard = REXCVAR_GET(texture_cache_memory_limit_hard);
+  const bool soft_at_default = (current_soft == 2048);
+  const bool hard_at_default = (current_hard == 4096);
+  if (soft_at_default && hard_at_default) {
+    REXCVAR_SET(texture_cache_memory_limit_soft, picked->soft_mb);
+    REXCVAR_SET(texture_cache_memory_limit_hard, picked->hard_mb);
+    REXGPU_INFO(
+        "Texture cache auto-tune: GPU has {} MB VRAM ({}), set soft={} MB hard={} MB",
+        vram_mb, picked->label, picked->soft_mb, picked->hard_mb);
+  } else {
+    REXGPU_INFO(
+        "Texture cache auto-tune: GPU has {} MB VRAM ({}), would suggest "
+        "soft={}/hard={} MB but user has pinned soft={}/hard={} — keeping user values",
+        vram_mb, picked->label, picked->soft_mb, picked->hard_mb, current_soft, current_hard);
+  }
+}
+
+}  // namespace
+
 
 bool D3D12Provider::IsD3D12APIAvailable() {
   HMODULE library_d3d12 = LoadLibraryW(L"D3D12.dll");
@@ -298,10 +356,17 @@ bool D3D12Provider::Initialize() {
     char* adapter_name_mb = reinterpret_cast<char*>(alloca(adapter_name_mb_size));
     if (WideCharToMultiByte(CP_UTF8, 0, adapter_desc.Description, -1, adapter_name_mb,
                             adapter_name_mb_size, nullptr, nullptr) != 0) {
-      REXGPU_INFO("DXGI adapter: {} (vendor 0x{:04X}, device 0x{:04X})", adapter_name_mb,
-                  adapter_desc.VendorId, adapter_desc.DeviceId);
+      REXGPU_INFO("DXGI adapter: {} (vendor 0x{:04X}, device 0x{:04X}, VRAM {} MB)",
+                  adapter_name_mb, adapter_desc.VendorId, adapter_desc.DeviceId,
+                  uint64_t(adapter_desc.DedicatedVideoMemory) / (1024ull * 1024ull));
     }
   }
+  // Auto-tune texture cache pool size based on DedicatedVideoMemory. Runs
+  // BEFORE D3D12CommandProcessor instantiates TextureCache, so the cvar
+  // values we set here are what the cache reads at construction. User pins
+  // in toml have already overwritten the cvar storage by this point — the
+  // helper only acts when both cvars are still at their SDK defaults.
+  AutoTuneTextureCacheLimits(static_cast<uint64_t>(adapter_desc.DedicatedVideoMemory));
 
   // Create the Direct3D 12 device.
   ID3D12Device* device;
