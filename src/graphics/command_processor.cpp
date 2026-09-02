@@ -1560,11 +1560,14 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* re
     }
     // 0xFFFFFEED is written to this two locations by D3D only on D3DISSUE_END
     // and used to detect a finished query.
+    // DPOUR MIGRATION 2026-09-02 (upstream 8e6baae): D3D does not always stamp
+    // both tiles of the pair, so requiring A && B misses ends and the guest
+    // spins waiting on the query. Either sentinel means D3DISSUE_END.
     bool is_end_via_z_pass =
-        pSampleCounts->ZPass_A == kQueryFinished && pSampleCounts->ZPass_B == kQueryFinished;
+        pSampleCounts->ZPass_A == kQueryFinished || pSampleCounts->ZPass_B == kQueryFinished;
     // Older versions of D3D also checks for ZFail (4D5307D5).
     bool is_end_via_z_fail =
-        pSampleCounts->ZFail_A == kQueryFinished && pSampleCounts->ZFail_B == kQueryFinished;
+        pSampleCounts->ZFail_A == kQueryFinished || pSampleCounts->ZFail_B == kQueryFinished;
     std::memset(pSampleCounts, 0, sizeof(xe_gpu_depth_sample_counts));
     if (is_end_via_z_pass || is_end_via_z_fail) {
       pSampleCounts->ZPass_A = fake_sample_count;

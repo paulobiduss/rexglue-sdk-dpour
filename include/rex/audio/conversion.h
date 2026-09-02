@@ -9,10 +9,17 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+// DPOUR MIGRATION 2026-09-02 (upstream 3b5ef8a+4c31fcc): the stereo fold used
+// to discard LFE, mix center at ad-hoc weights, skip clamping, and (scalar
+// path) swap bl/br. It now takes the StereoFold weights and a master gain.
+
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 
+#include <rex/assert.h>
+#include <rex/audio/downmix.h>
 #include <rex/platform.h>
 #include <rex/types.h>
 
@@ -20,7 +27,10 @@ namespace rex::audio::conversion {
 
 #if REX_ARCH_AMD64
 inline void sequential_6_BE_to_interleaved_6_LE(float* output, const float* input,
-                                                size_t ch_sample_count) {
+                                                size_t ch_sample_count, float gain) {
+  // The gain pass below walks the output four floats at a time.
+  assert_true(ch_sample_count % 2 == 0);
+
   const uint32_t* in = reinterpret_cast<const uint32_t*>(input);
   uint32_t* out = reinterpret_cast<uint32_t*>(output);
   const __m128i byte_swap_shuffle =
@@ -38,64 +48,88 @@ inline void sequential_6_BE_to_interleaved_6_LE(float* output, const float* inpu
     sample2 = rex::byte_swap(sample2);
     out[sample * 6 + 5] = sample2;
   }
+
+  // Second pass rather than fusing into the shuffle above, which stores as integers.
+  // 6 KB per 5.33 ms frame, so skipping it at unity gain is not worth the asymmetry.
+  const __m128 g = _mm_set1_ps(gain);
+  const __m128 lo = _mm_set1_ps(-1.0f);
+  const __m128 hi = _mm_set1_ps(1.0f);
+  const size_t count = ch_sample_count * 6;
+  for (size_t i = 0; i < count; i += 4) {
+    const __m128 v = _mm_mul_ps(_mm_loadu_ps(&output[i]), g);
+    _mm_storeu_ps(&output[i], _mm_min_ps(_mm_max_ps(v, lo), hi));
+  }
 }
 
 inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* input,
-                                                size_t ch_sample_count) {
+                                                size_t ch_sample_count, const StereoFold& fold,
+                                                float gain) {
   assert_true(ch_sample_count % 4 == 0);
 
   const __m128i byte_swap_shuffle =
       _mm_set_epi8(12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3);
-  const __m128 half = _mm_set1_ps(0.5f);
-  const __m128 two_fifths = _mm_set1_ps(1.0f / 2.5f);
+  const __m128 center = _mm_set1_ps(fold.center);
+  const __m128 lfe = _mm_set1_ps(fold.lfe);
+  const __m128 surround = _mm_set1_ps(fold.surround);
+  const __m128 scale = _mm_set1_ps(fold.scale * gain);
+  const __m128 lo = _mm_set1_ps(-1.0f);
+  const __m128 hi = _mm_set1_ps(1.0f);
 
-  // put center on left and right, discard low frequency
   for (size_t sample = 0; sample < ch_sample_count; sample += 4) {
     // load 4 samples from 6 channels each
     __m128 fl = _mm_loadu_ps(&input[0 * ch_sample_count + sample]);
     __m128 fr = _mm_loadu_ps(&input[1 * ch_sample_count + sample]);
     __m128 fc = _mm_loadu_ps(&input[2 * ch_sample_count + sample]);
+    __m128 lf = _mm_loadu_ps(&input[3 * ch_sample_count + sample]);
     __m128 bl = _mm_loadu_ps(&input[4 * ch_sample_count + sample]);
     __m128 br = _mm_loadu_ps(&input[5 * ch_sample_count + sample]);
     // byte swap
     fl = _mm_castsi128_ps(_mm_shuffle_epi8(_mm_castps_si128(fl), byte_swap_shuffle));
     fr = _mm_castsi128_ps(_mm_shuffle_epi8(_mm_castps_si128(fr), byte_swap_shuffle));
     fc = _mm_castsi128_ps(_mm_shuffle_epi8(_mm_castps_si128(fc), byte_swap_shuffle));
+    lf = _mm_castsi128_ps(_mm_shuffle_epi8(_mm_castps_si128(lf), byte_swap_shuffle));
     bl = _mm_castsi128_ps(_mm_shuffle_epi8(_mm_castps_si128(bl), byte_swap_shuffle));
     br = _mm_castsi128_ps(_mm_shuffle_epi8(_mm_castps_si128(br), byte_swap_shuffle));
 
-    __m128 center_halved = _mm_mul_ps(fc, half);
-    __m128 left = _mm_add_ps(_mm_add_ps(fl, bl), center_halved);
-    __m128 right = _mm_add_ps(_mm_add_ps(fr, br), center_halved);
-    left = _mm_mul_ps(left, two_fifths);
-    right = _mm_mul_ps(right, two_fifths);
+    // Center and LFE land on both sides.
+    const __m128 mid = _mm_add_ps(_mm_mul_ps(fc, center), _mm_mul_ps(lf, lfe));
+    __m128 left = _mm_mul_ps(_mm_add_ps(_mm_add_ps(fl, mid), _mm_mul_ps(bl, surround)), scale);
+    __m128 right = _mm_mul_ps(_mm_add_ps(_mm_add_ps(fr, mid), _mm_mul_ps(br, surround)), scale);
+    left = _mm_min_ps(_mm_max_ps(left, lo), hi);
+    right = _mm_min_ps(_mm_max_ps(right, lo), hi);
+
     _mm_storeu_ps(&output[sample * 2], _mm_unpacklo_ps(left, right));
     _mm_storeu_ps(&output[(sample + 2) * 2], _mm_unpackhi_ps(left, right));
   }
 }
 #else
 inline void sequential_6_BE_to_interleaved_6_LE(float* output, const float* input,
-                                                size_t ch_sample_count) {
+                                                size_t ch_sample_count, float gain) {
   for (size_t sample = 0; sample < ch_sample_count; sample++) {
     for (size_t channel = 0; channel < 6; channel++) {
-      output[sample * 6 + channel] = rex::byte_swap(input[channel * ch_sample_count + sample]);
+      const float v = rex::byte_swap(input[channel * ch_sample_count + sample]) * gain;
+      output[sample * 6 + channel] = std::clamp(v, -1.0f, 1.0f);
     }
   }
 }
+
 inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* input,
-                                                size_t ch_sample_count) {
+                                                size_t ch_sample_count, const StereoFold& fold,
+                                                float gain) {
   // Default 5.1 channel mapping is fl, fr, fc, lf, bl, br
   // https://docs.microsoft.com/en-us/windows/win32/xaudio2/xaudio2-default-channel-mapping
+  const float scale = fold.scale * gain;
   for (size_t sample = 0; sample < ch_sample_count; sample++) {
-    // put center on left and right, discard low frequency
-    float fl = rex::byte_swap(input[0 * ch_sample_count + sample]);
-    float fr = rex::byte_swap(input[1 * ch_sample_count + sample]);
-    float fc = rex::byte_swap(input[2 * ch_sample_count + sample]);
-    float br = rex::byte_swap(input[4 * ch_sample_count + sample]);
-    float bl = rex::byte_swap(input[5 * ch_sample_count + sample]);
-    float center_halved = fc * 0.5f;
-    output[sample * 2] = (fl + bl + center_halved) * (1.0f / 2.5f);
-    output[sample * 2 + 1] = (fr + br + center_halved) * (1.0f / 2.5f);
+    const float fl = rex::byte_swap(input[0 * ch_sample_count + sample]);
+    const float fr = rex::byte_swap(input[1 * ch_sample_count + sample]);
+    const float fc = rex::byte_swap(input[2 * ch_sample_count + sample]);
+    const float lf = rex::byte_swap(input[3 * ch_sample_count + sample]);
+    const float bl = rex::byte_swap(input[4 * ch_sample_count + sample]);
+    const float br = rex::byte_swap(input[5 * ch_sample_count + sample]);
+    // Center and LFE land on both sides.
+    const float mid = fc * fold.center + lf * fold.lfe;
+    output[sample * 2] = std::clamp((fl + mid + bl * fold.surround) * scale, -1.0f, 1.0f);
+    output[sample * 2 + 1] = std::clamp((fr + mid + br * fold.surround) * scale, -1.0f, 1.0f);
   }
 }
 #endif

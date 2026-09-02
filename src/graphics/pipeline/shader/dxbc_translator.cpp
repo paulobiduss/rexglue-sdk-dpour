@@ -14,19 +14,40 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
+#include <mutex>
+#include <system_error>
+#include <unordered_set>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/graphics/pipeline/shader/dxbc.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
 #include <rex/graphics/xenos.h>
+#include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/graphics_provider.h>
 
 REXCVAR_DEFINE_BOOL(dxbc_switch, true, "GPU/Shader", "Use switch statements in DXBC");
 
 REXCVAR_DEFINE_BOOL(dxbc_source_map, false, "GPU/Shader", "Generate source maps for DXBC");
+
+// dpour-fork 2026-07-02: log unique guest shader hashes at translation time.
+// User plays a target scene → shader-hash log lists all shaders touched →
+// we correlate with visible artifact to identify targeted patch candidates.
+REXCVAR_DEFINE_BOOL(log_shader_hashes, false, "GPU/Shader",
+                    "Log unique guest Xenos shader hashes at DXBC translation")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// dpour-fork 2026-07-02: dump translated DXBC bytes for each unique shader
+// hash to shader_dumps/{VS,PS}_{hash}.dxbc — for offline analysis via
+// `fxc /dumpbin` and design of targeted DXBC patches for guest game shaders.
+REXCVAR_DEFINE_BOOL(dump_shader_dxbc, false, "GPU/Shader",
+                    "Dump translated DXBC bytes to shader_dumps/ for offline "
+                    "analysis of guest game shaders")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics {
 using namespace ucode;
@@ -1224,6 +1245,32 @@ std::vector<uint8_t> DxbcShaderTranslator::CompleteTranslation() {
   std::vector<uint8_t> shader_object_bytes;
   shader_object_bytes.resize(shader_object_size_bytes);
   std::memcpy(shader_object_bytes.data(), shader_object_.data(), shader_object_size_bytes);
+
+  // dpour-fork 2026-07-02: dump DXBC bytes per unique shader hash to
+  // shader_dumps/{PS,VS}_{hash}.dxbc for offline analysis via fxc /dumpbin.
+  // Enabled via `dump_shader_dxbc` cvar.
+  if (REXCVAR_GET(dump_shader_dxbc)) {
+    static std::mutex s_dump_mutex;
+    static std::unordered_set<uint64_t> s_dumped;
+    const auto& shader = current_translation().shader();
+    const uint64_t hash = shader.ucode_data_hash();
+    const char* type =
+        shader.type() == xenos::ShaderType::kVertex ? "VS" : "PS";
+    std::lock_guard<std::mutex> lock(s_dump_mutex);
+    if (s_dumped.insert(hash).second) {
+      std::error_code ec;
+      std::filesystem::create_directories("shader_dumps", ec);
+      const std::string path =
+          fmt::format("shader_dumps/{}_{:016x}.dxbc", type, hash);
+      std::ofstream out(path, std::ios::binary | std::ios::trunc);
+      if (out) {
+        out.write(reinterpret_cast<const char*>(shader_object_bytes.data()),
+                  shader_object_bytes.size());
+        REXGPU_INFO("[shader-dump] {} hash={:016x} -> {} ({} bytes)", type,
+                    hash, path, shader_object_bytes.size());
+      }
+    }
+  }
   return shader_object_bytes;
 }
 
@@ -1231,6 +1278,22 @@ void DxbcShaderTranslator::PostTranslation() {
   Shader::Translation& translation = current_translation();
   if (!translation.is_valid()) {
     return;
+  }
+  // dpour-fork 2026-07-02: log unique shader hashes to correlate with
+  // visible artifacts. User plays a scene, then greps [shader-hash] in
+  // log to identify candidate shaders for targeted fixes.
+  if (REXCVAR_GET(log_shader_hashes)) {
+    static std::mutex s_hash_log_mutex;
+    static std::unordered_set<uint64_t> s_seen_hashes;
+    const uint64_t hash = translation.shader().ucode_data_hash();
+    const size_t sz = translation.shader().ucode_data().size();
+    const char* type =
+        translation.shader().type() == xenos::ShaderType::kVertex ? "VS" : "PS";
+    std::lock_guard<std::mutex> lock(s_hash_log_mutex);
+    if (s_seen_hashes.insert(hash).second) {
+      REXGPU_INFO("[shader-hash] {} hash={:016x} ucode_dwords={}", type, hash,
+                  sz);
+    }
   }
   DxbcShader* dxbc_shader = dynamic_cast<DxbcShader*>(&translation.shader());
   if (dxbc_shader &&

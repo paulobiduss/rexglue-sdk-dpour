@@ -46,6 +46,9 @@ class Win32Window : public Window {
 
   uint32_t GetMediumDpi() const override;
 
+  // DPOUR MIGRATION 2026-09-02: WM_INPUT-based raw mouse deltas for MnK look.
+  bool SetRawMouseMotion(bool enable, RawMouseMotionCallback callback) override;
+
  protected:
   bool OpenImpl() override;
   void RequestCloseImpl() override;
@@ -110,6 +113,10 @@ class Win32Window : public Window {
   // hwnd_ may be accessed by the cursor hiding timer callback from a separate
   // thread, but the timer can be active only with a valid window anyway.
   HWND hwnd_ = nullptr;
+
+  // DPOUR MIGRATION 2026-09-02: set and cleared on the UI thread, invoked from
+  // WndProc (also the UI thread) on WM_INPUT relative motion.
+  RawMouseMotionCallback raw_mouse_motion_callback_;
 
   uint32_t batched_size_update_depth_ = 0;
   bool batched_size_update_contained_wm_size_ = false;

@@ -22,6 +22,8 @@
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
 #include <rex/graphics/d3d12/command_processor.h>
+#include <rex/graphics/d3d12/native_rhi_d3d12.h>
+#include <rex/graphics/native_guest_renderer.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
@@ -439,10 +441,12 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
       return true;
     }
 
+    // DPOUR MIGRATION 2026-09-02 (upstream 8e6baae): either sentinel of the
+    // pair means D3DISSUE_END; requiring both misses ends (see base class).
     bool is_end_via_z_pass =
-        sample_counts->ZPass_A == kQueryFinished && sample_counts->ZPass_B == kQueryFinished;
+        sample_counts->ZPass_A == kQueryFinished || sample_counts->ZPass_B == kQueryFinished;
     bool is_end_via_z_fail =
-        sample_counts->ZFail_A == kQueryFinished && sample_counts->ZFail_B == kQueryFinished;
+        sample_counts->ZFail_A == kQueryFinished || sample_counts->ZFail_B == kQueryFinished;
     std::memset(sample_counts, 0, sizeof(xenos::xe_gpu_depth_sample_counts));
     if (is_end_via_z_pass || is_end_via_z_fail) {
       sample_counts->ZPass_A = fake_sample_count;
@@ -486,10 +490,11 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
     if (fake_sample_count < 0) {
       return true;
     }
+    // DPOUR MIGRATION 2026-09-02 (upstream 8e6baae): pairwise && -> ||.
     bool is_end_via_z_pass =
-        sample_counts->ZPass_A == kQueryFinished && sample_counts->ZPass_B == kQueryFinished;
+        sample_counts->ZPass_A == kQueryFinished || sample_counts->ZPass_B == kQueryFinished;
     bool is_end_via_z_fail =
-        sample_counts->ZFail_A == kQueryFinished && sample_counts->ZFail_B == kQueryFinished;
+        sample_counts->ZFail_A == kQueryFinished || sample_counts->ZFail_B == kQueryFinished;
     std::memset(sample_counts, 0, sizeof(xenos::xe_gpu_depth_sample_counts));
     if (is_end_via_z_pass || is_end_via_z_fail) {
       sample_counts->ZPass_A = fake_sample_count;
@@ -498,10 +503,13 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
     return true;
   };
 
+  // DPOUR MIGRATION 2026-09-02 (upstream 8e6baae): pairwise && -> ||. With &&
+  // a single-tile end sentinel was treated as a query BEGIN below, starting a
+  // bogus host query instead of finishing the guest's.
   bool is_end_via_z_pass =
-      sample_counts->ZPass_A == kQueryFinished && sample_counts->ZPass_B == kQueryFinished;
+      sample_counts->ZPass_A == kQueryFinished || sample_counts->ZPass_B == kQueryFinished;
   bool is_end_via_z_fail =
-      sample_counts->ZFail_A == kQueryFinished && sample_counts->ZFail_B == kQueryFinished;
+      sample_counts->ZFail_A == kQueryFinished || sample_counts->ZFail_B == kQueryFinished;
   bool is_end = is_end_via_z_pass || is_end_via_z_fail;
 
   if (!is_end) {
@@ -2003,6 +2011,11 @@ void D3D12CommandProcessor::ShutdownContext() {
   ShutdownGpuTimestampResources();
   ShutdownOcclusionQueryResources();
 
+  if (native_rhi_device_ != nullptr) {
+    DestroyNativeRhiDevice(native_rhi_device_);
+    native_rhi_device_ = nullptr;
+  }
+
   ui::d3d12::util::ReleaseAndNull(readback_buffer_);
   readback_buffer_size_ = 0;
   for (auto& resolve_readback_pair : readback_buffers_) {
@@ -2376,7 +2389,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, &swap_texture_srv_desc, frontbuffer_format, swap_texture_resource, guest_output_width,
-       guest_output_height](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+       guest_output_height, display_width,
+       display_height](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
         ID3D12Device* device = provider.GetDevice();
 
@@ -2433,6 +2447,31 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             frontbuffer_format == xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16;
 
         context.SetIs8bpc(!use_pwl_gamma_ramp && !use_fxaa);
+
+        if (HasNativeGuestOutputRenderer()) {
+          ID3D12Resource* native_guest_output_resource =
+              static_cast<ui::d3d12::D3D12Presenter::D3D12GuestOutputRefreshContext&>(context)
+                  .resource_uav_capable();
+          NativeGuestOutputRenderContext native_context;
+          native_context.backend = NativeGuestOutputBackend::kD3D12;
+          native_context.guest_output_width = guest_output_width;
+          native_context.guest_output_height = guest_output_height;
+          native_context.display_width = display_width;
+          native_context.display_height = display_height;
+          if (native_rhi_device_ == nullptr) {
+            native_rhi_device_ = CreateNativeRhiDevice(this);
+          }
+          native_context.device = native_rhi_device_;
+          native_context.cmd = NativeRhiBeginFrame(
+              native_rhi_device_, native_guest_output_resource,
+              ui::d3d12::D3D12Presenter::kGuestOutputFormat,
+              ui::d3d12::D3D12Presenter::kGuestOutputInternalState, guest_output_width,
+              guest_output_height, &native_context.guest_output);
+          if (TryRenderNativeGuestOutput(native_context)) {
+            EndSubmission(true);
+            return true;
+          }
+        }
 
         // Upload the new gamma ramp, using the upload buffer for the current
         // frame (will close the frame after this anyway, so can't write
@@ -2645,7 +2684,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
 }
 
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
-  if (REXCVAR_GET(d3d12_submit_on_primary_buffer_end) && submission_open_ &&
+  if (REXCVAR_GET(d3d12_submit_on_primary_buffer_end) &&
+      !ShouldSuppressEmulatedDraws() && submission_open_ &&
       CanEndSubmissionImmediately()) {
     EndSubmission(false);
   }
@@ -2686,6 +2726,16 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       PROFILE_DRAW_FINGERPRINT(fingerprint);
     }
 #endif
+    if (ShouldSuppressEmulatedDraws() &&
+        ShouldSuppressPassAtPitch(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch)) {
+      // Native output active: skip the resolves of SUPPRESSED passes; their
+      // draws left garbage in EDRAM, and copying it out would overwrite
+      // guest texture payloads the native renderer still samples. Passes
+      // that EXECUTE under the current suppression mode must keep their
+      // resolves (skate3-sdk: skipping an executed pass's resolve corrupts
+      // whatever the game composes through it).
+      return true;
+    }
     return IssueCopy();
   }
 
@@ -2731,6 +2781,23 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
+
+  // Native guest-output renderer active: suppress the emulated draws of the
+  // passes the native renderer replaces (per surface pitch; the mode cvar in
+  // native_guest_renderer.cpp decides which). Memexport draws always execute
+  // - the CPU reads their results. Ported from the skate3 SDK.
+  if (!memexport_used && ShouldSuppressEmulatedDraws()) {
+    const uint32_t suppress_pitch = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
+    if (ShouldSuppressPassAtPitch(suppress_pitch)) {
+      return true;
+    }
+    // Depth/stencil-only draws (no pixel shader) inside the EXEMPT passes:
+    // shadow casters and z-prepasses whose output feeds only the suppressed
+    // scene passes (the native renderer shadows itself).
+    if (pixel_shader == nullptr && ShouldSuppressExemptDepthOnlyDraws()) {
+      return true;
+    }
+  }
 
   if (!BeginSubmission(true)) {
     return false;

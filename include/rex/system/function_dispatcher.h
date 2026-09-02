@@ -66,6 +66,14 @@ class FunctionDispatcher : public IModuleRegistrar {
   uint64_t ExecuteInterrupt(ThreadState* thread_state, uint32_t address, uint64_t args[],
                             size_t arg_count);
 
+  /**
+   * DPOUR MIGRATION 2026-09-02 (upstream ff43ff6): executes guest code on a
+   * thread already running guest code, then restores its full register state,
+   * matching the 360 kernel's trap-frame APC delivery.
+   */
+  uint64_t ExecuteTrap(ThreadState* thread_state, uint32_t address, uint64_t args[],
+                       size_t arg_count);
+
   // Shared thunk region size per module.
   static constexpr uint32_t kThunkReserveSize = 0x10000;  // 64KB
 

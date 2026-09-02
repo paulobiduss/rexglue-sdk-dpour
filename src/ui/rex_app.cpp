@@ -43,7 +43,9 @@
 #include <rex/kernel/init.h>
 #include <rex/system.h>
 #include <rex/system/achievement_manager.h>
-#include <rex/system/gpu_plugin.h>
+// dpour-fork: gpu_plugin.h is a nightly-era header (plugin split for GPU
+// backend). v1.1.6 SDK compiles D3D12 directly into rexruntime — no plugin
+// dispatch needed. Removed to unblock v1.1.7 achievement port.
 #include <rex/system/kernel_state.h>
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>
@@ -498,21 +500,17 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
     if (input_sys) {
       input_sys->SetActiveCallback([this]() {
-        // SetActiveCallback drives ALL input drivers (MnK + SDL gamepad +
-        // any future ones). Returning false disables real-controller input
-        // too — so we gate ONLY on dialogs that explicitly want input
-        // capture (settings overlay etc.), NOT on passive overlays like
-        // fps_overlay / debug_overlay / ShaderCompileDialog (their
-        // WantsInputCapture() returns false). Without this filter,
-        // launching with the shader-compile dialog visible at startup
-        // already disabled both gamepad and mouse and hid the cursor.
-        // Achievement overlays are handled polymorphically by
-        // HasInputCapturingDialog via WantsInputCapture().
-        if (!imgui_drawer_->HasInputCapturingDialog()) {
-          return true;
-        }
-        const auto& io = imgui_drawer_->GetIO();
-        return !io.WantCaptureMouse && !io.WantCaptureKeyboard;
+        // dpour-fork 2026-07-03: use an EXPLICIT list of user-interactive
+        // overlays (settings / console / achievements) instead of the
+        // polymorphic HasInputCapturingDialog() poll. The polymorphic path
+        // hit a real regression: achievement_toast_ + achievement_notification_
+        // stay alive after boot and do NOT override WantsInputCapture()
+        // (default returns true), so HasInputCapturingDialog was ALWAYS
+        // true → SetActiveCallback returned false → input permanently
+        // disabled. The explicit-list version dodges the false positive
+        // entirely and only pauses real input when the user actually
+        // opened an interactive overlay.
+        return !(settings_overlay_ || console_overlay_ || achievements_overlay_);
       });
     }
   }

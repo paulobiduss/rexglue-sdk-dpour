@@ -44,6 +44,10 @@
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
+namespace rex::graphics::nrhi {
+class Device;
+}
+
 namespace rex::graphics::d3d12 {
 
 class D3D12CommandProcessor : public CommandProcessor {
@@ -103,6 +107,8 @@ class D3D12CommandProcessor : public CommandProcessor {
                                         const DxbcShader* pixel_shader, bool tessellated);
 
   ui::d3d12::D3D12UploadBufferPool& GetConstantBufferPool() const { return *constant_buffer_pool_; }
+
+  D3D12SharedMemory& GetSharedMemory() const { return *shared_memory_; }
 
   D3D12_CPU_DESCRIPTOR_HANDLE GetViewBindlessHeapCPUStart() const {
     assert_true(bindless_resources_used_);
@@ -836,6 +842,10 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   // Temporary storage for memexport stream constants used in the draw.
   std::vector<draw_util::MemExportRange> memexport_ranges_;
+
+  // Native-render RHI device (rex/graphics/native_rhi.h), created lazily on
+  // the first swap with a native guest-output renderer registered.
+  nrhi::Device* native_rhi_device_ = nullptr;
 };
 
 }  // namespace rex::graphics::d3d12

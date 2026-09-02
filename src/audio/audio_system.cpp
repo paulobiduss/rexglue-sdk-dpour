@@ -257,10 +257,20 @@ void AudioSystem::Shutdown() {
   worker_running_ = false;
   shutdown_event_->Set();
   if (worker_thread_) {
-    // The worker may be stuck inside a guest callback that is itself blocked
-    // on guest objects (e.g. KeWaitForMultipleObjects).
-    // Terminate the thread to break the deadlock.
-    worker_thread_->Terminate(0);
+    // DPOUR MIGRATION 2026-09-02 (upstream 0e4e996): the worker may be stuck
+    // inside a guest callback that is itself blocked on guest objects (e.g.
+    // KeWaitForMultipleObjects), so terminating is the last resort. Give it a
+    // chance to unwind first: TerminateThread abandons any lock the thread
+    // holds, including the CRT heap lock.
+    constexpr std::chrono::milliseconds kWorkerShutdownTimeout{500};
+    rex::thread::Thread* host_thread = worker_thread_->thread();
+    bool exited = host_thread && rex::thread::Wait(host_thread, false, kWorkerShutdownTimeout) ==
+                                     rex::thread::WaitResult::kSuccess;
+    if (!exited) {
+      REXAPU_WARN("Audio worker did not exit within {} ms; terminating",
+                  kWorkerShutdownTimeout.count());
+      worker_thread_->Terminate(0);
+    }
     worker_thread_.reset();
   }
 

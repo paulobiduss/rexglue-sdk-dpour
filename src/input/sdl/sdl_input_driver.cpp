@@ -135,9 +135,9 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
     attached_window_ = window;
     window->AddListener(this);
     window->app_context().CallInUIThreadSynchronous([this]() {
-      // Match Xenia's SDL setup: keep SDL from calling timeBeginPeriod(1) and
-      // weakening the process-wide NT timer resolution requested on startup.
-      SDL_SetHintWithPriority(SDL_HINT_TIMER_RESOLUTION, "0", SDL_HINT_OVERRIDE);
+      // DPOUR MIGRATION 2026-09-02 (upstream f5c8521 + input rework): let SDL
+      // manage timer resolution; suppressing it caused audio stretch and
+      // upstream removed the hint everywhere.
 
       // Initialize SDL events subsystem
       if (!SDL_InitSubSystem(SDL_INIT_EVENTS)) {

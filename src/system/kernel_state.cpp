@@ -649,13 +649,24 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
       auto global_lock = global_critical_region_.AcquireDeferred();
       while (dispatch_thread_running_) {
         global_lock.lock();
-        if (dispatch_queue_.empty()) {
+        // === DPOUR MIGRATION 2026-07-24: spurious-wakeup guard on the deferred
+        // completion queue (fixes intermittent save-never-completes / quit
+        // hang). Was `if (empty) { wait; ... }` — a condition_variable may wake
+        // SPURIOUSLY, and the old code then fell through to front()/pop_front()
+        // on an EMPTY queue = undefined behavior that can corrupt the queue and
+        // LOSE a queued overlapped completion, so the autosave overlapped never
+        // signals (icon spins forever; on quit the game waits for it -> stuck).
+        // Re-check the predicate in a loop (standard CV usage). To DISABLE,
+        // restore the original `if (dispatch_queue_.empty()) { wait; if
+        // (!dispatch_thread_running_) { unlock; break; } }`.
+        while (dispatch_queue_.empty() && dispatch_thread_running_) {
           dispatch_cond_.wait(global_lock);
-          if (!dispatch_thread_running_) {
-            global_lock.unlock();
-            break;
-          }
         }
+        if (!dispatch_thread_running_) {
+          global_lock.unlock();
+          break;
+        }
+        // === END DPOUR MIGRATION 2026-07-24 ===
         auto fn = std::move(dispatch_queue_.front());
         dispatch_queue_.pop_front();
         REXSYS_NOISY_DEBUG("Dispatch thread processing queued item ({} remaining)",

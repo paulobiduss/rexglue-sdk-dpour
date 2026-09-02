@@ -40,7 +40,10 @@ class ThreadState {
   uint32_t thread_id_ = 0;
 
   // NOTE: must be 64b aligned for SSE ops.
-  alignas(64)::PPCContext context_storage_;
+  // DPOUR MIGRATION 2026-09-02 (upstream 263a125): value-initialize so the
+  // PPCContext default member initializers survive; the old memset in the
+  // constructor ran after them and wiped every non-zero default.
+  alignas(64)::PPCContext context_storage_{};
   ::PPCContext* context_ = &context_storage_;
 };
 

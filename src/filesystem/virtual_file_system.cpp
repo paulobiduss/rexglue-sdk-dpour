@@ -328,11 +328,15 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
                   entry->absolute_path());
     }
   } else {
+    // dpour-fork 2026-09-02: demoted WARN -> DEBUG. A negative lookup is a
+    // normal answer, not a fault: the game enumerates save-backup content
+    // items by probing names that mostly do not exist, and at WARN that
+    // painted dozens of lines per enumeration.
     if (had_symlink) {
-      REXFS_WARN("VFS: entry not found for '{}' (via symlink '{}') on device '{}'", path,
-                 normalized_path, device->mount_path());
+      REXFS_DEBUG("VFS: entry not found for '{}' (via symlink '{}') on device '{}'", path,
+                  normalized_path, device->mount_path());
     } else {
-      REXFS_WARN("VFS: entry not found for '{}' on device '{}'", path, device->mount_path());
+      REXFS_DEBUG("VFS: entry not found for '{}' on device '{}'", path, device->mount_path());
     }
     remember_miss();
   }

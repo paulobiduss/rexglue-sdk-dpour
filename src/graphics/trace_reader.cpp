@@ -21,7 +21,11 @@
 #include <rex/memory/mapped_memory.h>
 #include <rex/platform.h>
 
-#include <snappy.h"
+// dpour-fork: the Xenia port left this include malformed (`<snappy.h"`), which
+// went unnoticed because trace_reader.cpp was never added to the build. Fixed
+// here so the trace tooling can be compiled; snappy is already a rexgraphics
+// link dependency, so nothing else changes.
+#include <snappy.h>
 
 namespace rex::graphics {
 

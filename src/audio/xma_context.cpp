@@ -204,11 +204,18 @@ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
   // keeps all contexts allocated and multiplexes voices via clear + re-kick).
   // The XMA bitstream is overlap-add: the ffmpeg decoder carries the previous
   // frame's spectral tail, and PrepareDecoder only reopens the codec when the
-  // sample rate or channel count changes. Without a flush, the first frame of
-  // the next sound on this context gets overlap-added with the tail of the
-  // previous one - audible as crunchy/echo-like corruption on one-shot SFX.
-  if (av_context_ && avcodec_is_open(av_context_)) {
-    avcodec_flush_buffers(av_context_);
+  // sample rate or channel count changes. Without dropping that tail, the
+  // first frame of the next sound on this context gets overlap-added with the
+  // tail of the previous one - audible as crunchy/echo-like corruption on
+  // one-shot SFX.
+  // DPOUR MIGRATION 2026-09-02 (upstream f96d31a): avcodec_flush_buffers()
+  // cannot drop it: ff_xmaframes_decoder declares no flush callback, so the
+  // call never reaches the code clearing channel[].out. Invalidating the
+  // cached format makes PrepareDecoder reopen the codec on the next decode,
+  // which does discard the history.
+  if (av_context_) {
+    av_context_->sample_rate = 0;
+    av_context_->channels = 0;
   }
 
   data->input_buffer_0_valid = 0;

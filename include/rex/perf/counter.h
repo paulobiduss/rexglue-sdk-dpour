@@ -60,6 +60,23 @@ enum class DrawBucket : uint8_t {
   // The buffer-to-image copy phase of a texture upload (kTextureUpload then
   // covers only the load compute dispatches and their barriers).
   kTextureUploadCopy,
+  // The native guest-output renderer's whole GPU pass (scene + 2D replay +
+  // resolve), recorded inside IssueSwap. Runs until frame end.
+  kNativeScene,
+  // Native-pass stages (nrhi::Cmd::ProfileRegion): successive marks partition
+  // the native pass into its renderer-defined stages; when the renderer marks
+  // them, they replace kNativeScene in the frame's attribution.
+  kNativeCommit,   // content-store commits, decode uploads, eviction
+  kNativeShadow,   // dynamic caster shadow atlas + blur
+  kNativeSun,      // static sun-shadow cascade renders
+  kNativeMain,     // main scene pass (opaque + transparent + SSR G-buffer)
+  kNativeResolve,  // MSAA resolve + outline composite
+  kNativeAo,       // screen-space ambient occlusion
+  kNativeSsr,      // screen-space reflection march + composite
+  kNativeVol,      // volumetric sun shafts + haze
+  kNativeBloom,    // bloom pyramid + tonemap
+  kNative2d,       // photo grab, blur chains, 2D overlay replay
+  kNativeTail,     // after the last stage: backend/present tail
   kCount,
 };
 
@@ -98,6 +115,30 @@ inline const char* DrawBucketName(DrawBucket bucket) {
       return "ResolveGap";
     case DrawBucket::kTextureUploadCopy:
       return "TexUpCopy";
+    case DrawBucket::kNativeScene:
+      return "Native";
+    case DrawBucket::kNativeCommit:
+      return "NatCommit";
+    case DrawBucket::kNativeShadow:
+      return "NatShadow";
+    case DrawBucket::kNativeSun:
+      return "NatSun";
+    case DrawBucket::kNativeMain:
+      return "NatMain";
+    case DrawBucket::kNativeResolve:
+      return "NatResolve";
+    case DrawBucket::kNativeAo:
+      return "NatAO";
+    case DrawBucket::kNativeSsr:
+      return "NatSSR";
+    case DrawBucket::kNativeVol:
+      return "NatVol";
+    case DrawBucket::kNativeBloom:
+      return "NatBloom";
+    case DrawBucket::kNative2d:
+      return "Nat2D";
+    case DrawBucket::kNativeTail:
+      return "NatTail";
     default:
       return "Unknown";
   }

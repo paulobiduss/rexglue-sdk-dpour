@@ -82,6 +82,28 @@ REXCVAR_DEFINE_INT32(resolution_scale, 2, "GPU",
     .range(1, 8)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// dpour-fork 2026-07-02: relax the `key.tiled` gate in FindOrCreateTexture's
+// scaled-resolve check. UE3 (Silent Hill: Downpour) resolves EDRAM RTs into
+// LINEAR (non-tiled) guest textures for GaussianBlur / DoF / bloom
+// intermediates. The resolve dispatch itself does write scaled content into
+// scaled_resolve_buffer and calls MarkRangeAsResolved — so scaled_resolve_pages_
+// IS populated for those ranges. But the read side in FindOrCreateTexture
+// requires `key.tiled &&` before ever consulting IsRangeScaledResolved(...),
+// so linear textures skip the check entirely and load unscaled bytes from
+// shared_memory instead of scaled bytes from scaled_resolve_buffer. Symptom:
+// vertical banding / checkerboard on post-processed surfaces at scale > 1;
+// "swap source is unscaled" warning at d3d12/command_processor.cpp:2347.
+// When true, this cvar permits linear textures to also consult
+// scaled_resolve_pages_ and pick up scaled_resolve=1 when appropriate.
+REXCVAR_DEFINE_BOOL(ue3_scaled_linear_resolve, false, "GPU",
+                    "Permit linear (non-tiled) textures to consult the scaled "
+                    "resolve pages when checking if their guest range was written "
+                    "by a scaled resolve. Fixes UE3 (Silent Hill: Downpour) "
+                    "GaussianBlur/DoF checkerboarding at scale > 1. Off by default "
+                    "— affects any game whose post-process chain resolves into "
+                    "linear textures.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_INT32(vulkan_debug_log_frame_summaries_remaining, 0, "GPU/Vulkan",
                      "Track Vulkan per-frame draw summaries for this many frames")
     .range(0, 36000)
@@ -1438,7 +1460,12 @@ void TextureCache::DestroyAllTextures(bool from_destructor) {
 
 TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   // Check if the texture is a scaled resolve texture.
-  if (IsDrawResolutionScaled() && key.tiled && IsScaledResolveSupportedForFormat(key)) {
+  // dpour-fork 2026-07-02: the `key.tiled` gate is relaxed when
+  // ue3_scaled_linear_resolve is true, so linear (non-tiled) UE3 PostProcess
+  // resolve destinations can also pick up the scaled resolve chain.
+  const bool allow_linear_scaled_resolve = REXCVAR_GET(ue3_scaled_linear_resolve);
+  if (IsDrawResolutionScaled() && (key.tiled || allow_linear_scaled_resolve) &&
+      IsScaledResolveSupportedForFormat(key)) {
     texture_util::TextureGuestLayout scaled_resolve_guest_layout = key.GetGuestLayout();
     if ((scaled_resolve_guest_layout.base.level_data_extent_bytes &&
          IsRangeScaledResolved(key.base_page << 12,

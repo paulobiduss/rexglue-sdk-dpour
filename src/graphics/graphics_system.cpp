@@ -335,6 +335,9 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
     BeginTracing();
   }
 
+  // dpour-fork 2026-09-02: the native post-process skeleton left the build
+  // with the retired native render layer.
+
   return X_STATUS_SUCCESS;
 }
 

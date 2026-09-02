@@ -33,6 +33,11 @@ REXCVAR_DEFINE_STRING(game_data_root, "", "Runtime", "Override game data path");
 REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
 REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data path");
 REXCVAR_DEFINE_STRING(cache_path, "", "Runtime", "Override shader cache path");
+// dpour-fork 2026-07-02: metadata_root cvar restored for achievement icon
+// asset discovery. Nightly added it as part of the embedded metadata
+// registry; v1.1.6 SDK never had a cvar for it, but the ported
+// Runtime::FindMetadataPath() branch does.
+REXCVAR_DEFINE_STRING(metadata_root, "", "Runtime", "Override metadata path (achievement icons etc.)");
 
 namespace rex {
 

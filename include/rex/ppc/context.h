@@ -542,10 +542,13 @@ struct alignas(0x40) PPCContext {
 #if !defined(REX_CONFIG_NON_VOLATILE_AS_LOCAL)
   //--- Non-volatile register save/restore --------
   // Layout: r14-r31 (144) | f14-f31 (144) | v14-v31 (288) | v64-v127 (1024)
-  // Total: 1600 bytes.  Buffer must be at least this large.
+  //       | cr2-cr4 | fpscr.  Buffer must be at least kNonVolatileSaveSize.
+  // DPOUR MIGRATION 2026-09-02 (upstream a1f5144): cr2-cr4 and fpscr are
+  // non-volatile on PPC too; without them every fiber switch clobbered the
+  // guest's condition fields and FP rounding mode.
   static constexpr size_t kNonVolatileSaveSize =
       18 * sizeof(PPCRegister) + 18 * sizeof(PPCRegister) + 18 * sizeof(PPCVRegister) +
-      64 * sizeof(PPCVRegister);
+      64 * sizeof(PPCVRegister) + 3 * sizeof(PPCCRRegister) + sizeof(PPCFPSCRRegister);
 
   inline void SaveNonVolatiles(uint8_t* dst) const {
     std::memcpy(dst, &r14, 18 * sizeof(PPCRegister));
@@ -555,6 +558,10 @@ struct alignas(0x40) PPCContext {
     std::memcpy(dst, &v14, 18 * sizeof(PPCVRegister));
     dst += 18 * sizeof(PPCVRegister);
     std::memcpy(dst, &v64, 64 * sizeof(PPCVRegister));
+    dst += 64 * sizeof(PPCVRegister);
+    std::memcpy(dst, &cr2, 3 * sizeof(PPCCRRegister));
+    dst += 3 * sizeof(PPCCRRegister);
+    std::memcpy(dst, &fpscr, sizeof(PPCFPSCRRegister));
   }
 
   inline void RestoreNonVolatiles(const uint8_t* src) {
@@ -565,6 +572,20 @@ struct alignas(0x40) PPCContext {
     std::memcpy(&v14, src, 18 * sizeof(PPCVRegister));
     src += 18 * sizeof(PPCVRegister);
     std::memcpy(&v64, src, 64 * sizeof(PPCVRegister));
+    src += 64 * sizeof(PPCVRegister);
+    std::memcpy(&cr2, src, 3 * sizeof(PPCCRRegister));
+    src += 3 * sizeof(PPCCRRegister);
+    // Fibers share one host thread, so the hardware csr still holds the
+    // OUTGOING fiber's state and must be resynced to the restored one. A
+    // zeroed snapshot is a fiber that never ran (its context buffer is
+    // memset at creation): keep the current FP state - setcsr(0) would
+    // unmask every FP exception.
+    PPCFPSCRRegister saved_fpscr;
+    std::memcpy(&saved_fpscr, src, sizeof(PPCFPSCRRegister));
+    if (saved_fpscr.csr != 0) {
+      fpscr = saved_fpscr;
+      fpscr.setcsr(fpscr.csr);
+    }
   }
 #else
   static constexpr size_t kNonVolatileSaveSize = 0;

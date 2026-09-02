@@ -12,12 +12,56 @@
 #include <rex/ui/overlay/debug_overlay.h>
 #include <rex/version.h>
 #include <imgui.h>
+#include <algorithm>
+#include <vector>
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
 #include <rex/perf/counter.h>
 #include <cinttypes>
 #endif
 
 namespace rex::ui {
+
+namespace {
+
+// Sections registered by the running title. See debug_overlay.h.
+struct OverlaySection {
+  uint32_t id = 0;
+  std::string title;
+  DebugOverlaySectionDrawer drawer;
+  bool wants_input = true;
+};
+std::vector<OverlaySection>& Sections() {
+  static std::vector<OverlaySection> s;
+  return s;
+}
+
+}  // namespace
+
+uint32_t RegisterDebugOverlaySection(std::string_view title, DebugOverlaySectionDrawer drawer,
+                                     bool wants_input) {
+  static uint32_t next_id = 1;
+  if (!drawer) {
+    return 0;
+  }
+  const uint32_t id = next_id++;
+  Sections().push_back(OverlaySection{id, std::string(title), std::move(drawer), wants_input});
+  return id;
+}
+
+void UnregisterDebugOverlaySection(uint32_t id) {
+  auto& s = Sections();
+  s.erase(std::remove_if(s.begin(), s.end(), [id](const OverlaySection& o) { return o.id == id; }),
+          s.end());
+}
+
+bool DebugOverlayHasInteractiveSection() {
+  for (const auto& s : Sections()) {
+    if (s.wants_input) {
+      return true;
+    }
+  }
+  return false;
+}
 
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
 namespace {
@@ -197,6 +241,15 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
 #else
     ImGui::TextUnformatted("Perf counters are disabled in this build.");
 #endif
+    // Whatever the running title added, after everything the SDK draws.
+    for (const auto& section : Sections()) {
+      ImGui::Separator();
+      if (ImGui::CollapsingHeader(section.title.c_str(), ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::PushID(static_cast<int>(section.id));
+        section.drawer();
+        ImGui::PopID();
+      }
+    }
   }
   ImGui::End();
   ImGui::PopStyleVar();

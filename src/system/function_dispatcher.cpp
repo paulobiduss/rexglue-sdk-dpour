@@ -135,6 +135,26 @@ uint64_t FunctionDispatcher::Execute(ThreadState* thread_state, uint32_t address
   return ctx->r3.u64;
 }
 
+uint64_t FunctionDispatcher::ExecuteTrap(ThreadState* thread_state, uint32_t address,
+                                         uint64_t args[], size_t arg_count) {
+  // DPOUR MIGRATION 2026-09-02 (upstream ff43ff6): an APC interrupts guest
+  // code mid-flight; without this snapshot the routine's register usage leaks
+  // into the interrupted function.
+  auto* ctx = thread_state->context();
+  PPCContext saved = *ctx;
+
+  uint64_t result = Execute(thread_state, address, args, arg_count);
+
+  *ctx = saved;
+  // Resync the hardware csr to the restored logical state (our FPSCR caches
+  // fpu/vmx words; csr == 0 means FP state was never initialized on this
+  // thread - leave the hardware alone, setcsr(0) would unmask everything).
+  if (ctx->fpscr.csr != 0) {
+    ctx->fpscr.setcsr(ctx->fpscr.csr);
+  }
+  return result;
+}
+
 uint64_t FunctionDispatcher::ExecuteInterrupt(ThreadState* thread_state, uint32_t address,
                                               uint64_t args[], size_t arg_count) {
   SCOPE_profile_cpu_f("cpu");

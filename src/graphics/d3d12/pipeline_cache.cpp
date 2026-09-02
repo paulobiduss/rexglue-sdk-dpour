@@ -1555,10 +1555,11 @@ void PipelineCache::ReportFrameBoundary(uint64_t frame_duration_ns) {
   const bool log_for_rt_resolve = verbose && rt_resolve_ms > 5.0;
   const bool log_for_submit_barriers = verbose && submit_barriers_ms > 5.0;
   const bool log_for_fence_wait = verbose && fence_wait_ms > 5.0;
-  // Guest-CPU stall trigger — PRIMARY (not verbose-gated) so Class B
-  // investigation surfaces guest-thread block frames even if no render-thread
-  // bucket is interesting. 5 ms threshold matches the secondary triggers.
-  const bool log_for_guest_cpu = guest_cpu_total_ms > 5.0;
+  // Guest-CPU stall trigger. Was PRIMARY (not verbose-gated) during the
+  // Class B stall investigation; with that closed, > 5 ms of guest CPU is
+  // just a normal gameplay frame and the line fired every frame. 2026-09-02:
+  // gated behind pso_stall_log_verbose like the other per-frame triggers.
+  const bool log_for_guest_cpu = verbose && guest_cpu_total_ms > 5.0;
   if (!(log_for_frame_spike || log_for_misses || log_for_compile || log_for_translate ||
         log_for_skipped || log_for_block || log_for_submit || log_for_present ||
         log_for_tex_req || log_for_rt_resolve || log_for_submit_barriers || log_for_fence_wait ||

@@ -193,16 +193,13 @@ class SharedMemory {
   // Things below should be fully protected by global_critical_region.
   // ***************************************************************************
 
-  // Double-buffered valid-page flags for lockless checks in RequestRanges.
-  std::vector<uint64_t> valid_buffer_a_;
-  std::vector<uint64_t> valid_buffer_b_;
-  std::atomic<uint64_t*> active_valid_flags_{nullptr};
-  std::atomic<uint64_t*> staging_valid_flags_{nullptr};
+  // DPOUR MIGRATION 2026-09-02 (upstream 6124b36): single lock-protected valid
+  // flags replace the double-buffered active/staging pair, whose copies could
+  // drift and leave frame-end refresh working on stale state.
+  // Pages whose contents in the buffer are in sync with guest memory.
+  std::vector<uint64_t> system_page_flags_valid_;
   // Subset of valid pages containing data written by the GPU.
   std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
-  // Dirty state tracking for frame-end page-state refresh.
-  std::atomic<bool> gpu_written_data_dirty_{false};
-  std::atomic<uint32_t> dirty_blocks_{0};
   uint32_t num_system_page_flags_ = 0;
 
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(

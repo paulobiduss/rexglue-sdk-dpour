@@ -14,6 +14,7 @@
 #include <rex/ui/virtual_key.h>
 #include <rex/ui/window_listener.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <mutex>
@@ -80,7 +81,12 @@ class MnkInputDriver final : public InputDriver,
   uint32_t UserIndex() const;
   bool IsEnabled() const;
   void CenterCursor();
-  void UpdateMouseCapture();
+  // DPOUR MIGRATION 2026-09-02 (upstream b458afe, adapted): GetState runs on
+  // the guest thread, but every Window call in the capture path reaches the
+  // platform window. The guest side only queues the desired state; the apply
+  // runs on the UI thread, coalesced to one post in flight.
+  void QueueMouseCaptureUpdate(bool should_capture);
+  void ApplyMouseCaptureFromUIThread();
   void SetKeyState(uint16_t vk, bool down);
   // PR #311: flags = X_INPUT_KEYSTROKE_KEYDOWN / KEYUP / REPEAT, etc.
   // dpour: kept our old simpler signature replaced by the flags version
@@ -102,10 +108,22 @@ class MnkInputDriver final : public InputDriver,
   // Mouse delta tracking
   int32_t mouse_dx_ = 0;
   int32_t mouse_dy_ = 0;
+  // DPOUR MIGRATION 2026-09-02: raw-input (WM_INPUT) delta accumulators.
+  // Filled by the window's raw-motion callback (UI thread), drained by
+  // GetState (guest thread) - both under state_mutex_.
+  float raw_mouse_dx_ = 0.0f;
+  float raw_mouse_dy_ = 0.0f;
+  // True while the window delivers raw motion; UI thread writes.
+  std::atomic<bool> raw_input_active_{false};
   int32_t prev_mouse_x_ = 0;
   int32_t prev_mouse_y_ = 0;
-  bool mouse_captured_ = false;
+  // Written on the UI thread; the guest thread reads it in the queue-skip test.
+  std::atomic<bool> mouse_captured_{false};
   bool has_focus_ = true;
+
+  // Guest thread to UI thread; the queued flag coalesces the posts.
+  std::atomic<bool> mouse_capture_requested_{false};
+  std::atomic<bool> mouse_capture_update_queued_{false};
 
   // Keystroke queue
   std::queue<X_INPUT_KEYSTROKE> keystroke_queue_;

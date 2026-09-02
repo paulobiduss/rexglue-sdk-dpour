@@ -30,6 +30,21 @@ REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller 
 REXCVAR_DEFINE_BOOL(mnk_capture_mouse, false, "Input",
                     "Capture and hide mouse cursor while MnK is active");
 REXCVAR_DEFINE_INT32(mnk_user_index, 0, "Input", "Controller slot (0-3) for MnK").range(0, 3);
+// DPOUR MIGRATION 2026-09-02: raw-input mouse look. These three keys are the
+// ones the v1.1.x launcher already writes into downpour.toml; the WM_MOUSEMOVE
+// path below (mnk_sensitivity et al.) stays as the fallback when raw input is
+// unavailable or turned off. Raw deltas skip Windows pointer acceleration AND
+// the acceleration curve: response = delta * mnk_raw_input_scale *
+// mnk_stick_scale, fed through the same smoothing/decay/deadzone stages.
+REXCVAR_DEFINE_BOOL(mnk_use_raw_input, true, "Input",
+                    "Drive mouse look from raw input (WM_INPUT) deltas instead of window "
+                    "mouse-move events. Bypasses Windows pointer acceleration.");
+REXCVAR_DEFINE_DOUBLE(mnk_raw_input_scale, 0.6, "Input",
+                      "Raw-input mouse look: linear multiplier on raw deltas")
+    .range(0.01, 10.0);
+REXCVAR_DEFINE_DOUBLE(mnk_stick_scale, 800.0, "Input",
+                      "Raw-input mouse look: stick deflection per scaled raw count")
+    .range(1.0, 32767.0);
 REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 0.6, "Input", "Mouse sensitivity for right stick")
     .range(0.01, 10.0);
 // How responsive the stick is to fresh mouse input. 0 = no smoothing (instant
@@ -104,6 +119,9 @@ MnkInputDriver::MnkInputDriver(rex::ui::Window* window, size_t window_z_order)
 MnkInputDriver::~MnkInputDriver() {
   // Detach handled by OnClosing; if window outlives the driver, clean up here.
   if (attached_window_) {
+    if (raw_input_active_.exchange(false, std::memory_order_relaxed)) {
+      attached_window_->SetRawMouseMotion(false, nullptr);
+    }
     attached_window_->RemoveInputListener(this);
     attached_window_->RemoveListener(this);
     attached_window_ = nullptr;
@@ -125,6 +143,9 @@ void MnkInputDriver::OnWindowAvailable(rex::ui::Window* window) {
 
 void MnkInputDriver::OnClosing(rex::ui::UIEvent&) {
   if (attached_window_) {
+    if (raw_input_active_.exchange(false, std::memory_order_relaxed)) {
+      attached_window_->SetRawMouseMotion(false, nullptr);
+    }
     if (mouse_captured_) {
       mouse_captured_ = false;
       attached_window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kVisible);
@@ -148,6 +169,8 @@ void MnkInputDriver::ClearStateLocked() {
   std::memset(key_down_, 0, sizeof(key_down_));
   mouse_dx_ = 0;
   mouse_dy_ = 0;
+  raw_mouse_dx_ = 0.0f;
+  raw_mouse_dy_ = 0.0f;
   // PR #311 fields: per-pad hold-state must clear too, otherwise REPEAT
   // events fire spuriously when focus returns.
   for (auto& s : pad_states_) {
@@ -257,7 +280,10 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
-  UpdateMouseCapture();
+  // DPOUR MIGRATION 2026-09-02 (upstream b458afe, adapted): this is the guest
+  // thread - only queue the desired capture state, never touch the window.
+  QueueMouseCaptureUpdate(IsEnabled() && has_focus_ && is_active() &&
+                          REXCVAR_GET(mnk_capture_mouse));
 
   if (!is_active() || !has_focus_) {
     std::lock_guard lock(state_mutex_);
@@ -351,49 +377,82 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
     double mag = std::pow(std::abs(static_cast<double>(dpx)), accel_exp);
     return std::copysign(mag, static_cast<double>(dpx));
   };
-  double new_rx = curved(mouse_dx_) * sensitivity * kBaseScale;
-  double new_ry = curved(mouse_dy_) * sensitivity * kBaseScale;
-  // Stick Y is up=positive, screen Y is down=positive, so invert by default.
-  // mnk_invert_y flips back to "down on mouse = look down on stick" feel.
-  new_ry = invert_y ? new_ry : -new_ry;
+  constexpr double kInt16Max = 32767.0;
+  int32_t rx = 0;
+  int32_t ry = 0;
+  if (raw_input_active_.load(std::memory_order_relaxed)) {
+    // DPOUR 2026-09-02, reworked after live feedback ("feels like a stick"):
+    // raw deltas map to deflection DIRECTLY - no EMA smoothing, no decay tail,
+    // no ramp remap. Motion this poll = deflection this poll; no motion =
+    // instant zero, so the camera stops when the hand stops. The floor puts
+    // every nonzero delta past the game's inner right-stick deadzone (XInput
+    // canonical 8689) - below it the game discards the input entirely, which
+    // read as "slow/dead mouse". The stick's +-32767 remains the hard ceiling:
+    // the game's input model cannot turn faster than a fully deflected stick.
+    const double raw_gain = REXCVAR_GET(mnk_raw_input_scale) * REXCVAR_GET(mnk_stick_scale);
+    const double raw_floor = std::max(deadzone_floor, 8689.0);
+    auto raw_axis = [&](double d) -> int32_t {
+      if (d == 0.0) {
+        return 0;
+      }
+      double v = raw_floor + std::abs(d) * raw_gain;
+      return static_cast<int32_t>(std::copysign(std::min(v, kInt16Max), d));
+    };
+    rx = raw_axis(static_cast<double>(raw_mouse_dx_));
+    // Stick Y is up=positive, screen Y is down=positive, so invert by default.
+    ry = raw_axis(invert_y ? static_cast<double>(raw_mouse_dy_)
+                           : -static_cast<double>(raw_mouse_dy_));
+    // Keep the legacy filter state cold so a path toggle starts clean.
+    mouse_stick_x_ = 0.0;
+    mouse_stick_y_ = 0.0;
+  } else {
+    double new_rx = curved(mouse_dx_) * sensitivity * kBaseScale;
+    double new_ry = curved(mouse_dy_) * sensitivity * kBaseScale;
+    // Stick Y is up=positive, screen Y is down=positive, so invert by default.
+    // mnk_invert_y flips back to "down on mouse = look down on stick" feel.
+    new_ry = invert_y ? new_ry : -new_ry;
+
+    // Mouse velocity → stick mapping with a one-pole low-pass filter.
+    // `smoothing` is the EMA carry-over alpha; lower = more responsive but more
+    // raw twitchy variance. Default 0.15 keeps ~2-3 ms perceived lag.
+    auto update_stick_axis = [&](double new_v, double& stick) {
+      if (new_v != 0.0) {
+        double target = std::clamp(new_v, -kInt16Max, kInt16Max);
+        stick = stick * smoothing + target * (1.0 - smoothing);
+      } else {
+        stick *= decay;
+        if (std::abs(stick) < 1.0) stick = 0.0;
+      }
+    };
+    update_stick_axis(new_rx, mouse_stick_x_);
+    update_stick_axis(new_ry, mouse_stick_y_);
+
+    // Smooth-ramp deadzone compensation. The hard-jump from 0 to ~9500 in the
+    // old code was a major source of the "stick-not-mouse" feel: 1 stray pixel
+    // would catapult the stick a third of the way to max. Now we linearly ramp
+    // 0..kRampWindow into 0..deadzone_floor, then linearly to kInt16Max above.
+    constexpr double kRampWindow = 800.0;
+    auto remap_axis = [&](double v) -> int32_t {
+      if (v == 0.0) return 0;
+      double mag = std::min(std::abs(v), kInt16Max);
+      double scaled;
+      if (mag < kRampWindow) {
+        scaled = (mag / kRampWindow) * deadzone_floor;
+      } else {
+        double t = (mag - kRampWindow) / (kInt16Max - kRampWindow);
+        scaled = deadzone_floor + t * (kInt16Max - deadzone_floor);
+      }
+      return static_cast<int32_t>(std::copysign(scaled, v));
+    };
+    rx = remap_axis(mouse_stick_x_);
+    ry = remap_axis(mouse_stick_y_);
+  }
+  // Drain both accumulators unconditionally so toggling paths never dumps a
+  // backlog into one frame.
   mouse_dx_ = 0;
   mouse_dy_ = 0;
-
-  // Mouse velocity → stick mapping with a one-pole low-pass filter.
-  // `smoothing` is the EMA carry-over alpha; lower = more responsive but more
-  // raw twitchy variance. Default 0.15 keeps ~2-3 ms perceived lag.
-  constexpr double kInt16Max = 32767.0;
-  auto update_stick_axis = [&](double new_v, double& stick) {
-    if (new_v != 0.0) {
-      double target = std::clamp(new_v, -kInt16Max, kInt16Max);
-      stick = stick * smoothing + target * (1.0 - smoothing);
-    } else {
-      stick *= decay;
-      if (std::abs(stick) < 1.0) stick = 0.0;
-    }
-  };
-  update_stick_axis(new_rx, mouse_stick_x_);
-  update_stick_axis(new_ry, mouse_stick_y_);
-
-  // Smooth-ramp deadzone compensation. The hard-jump from 0 to ~9500 in the
-  // old code was a major source of the "stick-not-mouse" feel: 1 stray pixel
-  // would catapult the stick a third of the way to max. Now we linearly ramp
-  // 0..kRampWindow into 0..deadzone_floor, then linearly to kInt16Max above.
-  constexpr double kRampWindow = 800.0;
-  auto remap_axis = [&](double v) -> int32_t {
-    if (v == 0.0) return 0;
-    double mag = std::min(std::abs(v), kInt16Max);
-    double scaled;
-    if (mag < kRampWindow) {
-      scaled = (mag / kRampWindow) * deadzone_floor;
-    } else {
-      double t = (mag - kRampWindow) / (kInt16Max - kRampWindow);
-      scaled = deadzone_floor + t * (kInt16Max - deadzone_floor);
-    }
-    return static_cast<int32_t>(std::copysign(scaled, v));
-  };
-  int32_t rx = remap_axis(mouse_stick_x_);
-  int32_t ry = remap_axis(mouse_stick_y_);
+  raw_mouse_dx_ = 0.0f;
+  raw_mouse_dy_ = 0.0f;
 
   auto clamp16 = [](int32_t v) -> int16_t {
     return static_cast<int16_t>(std::clamp(v, (int32_t)INT16_MIN, (int32_t)INT16_MAX));
@@ -651,27 +710,71 @@ void MnkInputDriver::CenterCursor() {
 #endif
 }
 
-void MnkInputDriver::UpdateMouseCapture() {
-  if (!attached_window_)
+// DPOUR MIGRATION 2026-09-02 (upstream b458afe, adapted to our driver): the
+// old UpdateMouseCapture ran on the guest input poll and called
+// SetCursorVisibility / CaptureMouse / SetCursorPos there - platform window
+// calls from the guest thread, a poll-stall and priority-inversion source.
+void MnkInputDriver::QueueMouseCaptureUpdate(bool should_capture) {
+  mouse_capture_requested_.store(should_capture, std::memory_order_relaxed);
+  if (!attached_window_) {
     return;
+  }
+  // Nothing to do and nothing captured: skip the post entirely (the common
+  // case when MnK capture is off). While captured, keep posting so the
+  // per-frame recenter keeps running.
+  if (!should_capture && !mouse_captured_.load(std::memory_order_relaxed)) {
+    return;
+  }
+  if (mouse_capture_update_queued_.exchange(true, std::memory_order_acq_rel)) {
+    return;  // one post in flight is enough - the apply reads the latest state
+  }
+  attached_window_->app_context().CallInUIThread([this]() {
+    mouse_capture_update_queued_.store(false, std::memory_order_release);
+    ApplyMouseCaptureFromUIThread();
+  });
+}
 
-  bool should_capture = IsEnabled() && has_focus_ && is_active() && REXCVAR_GET(mnk_capture_mouse);
+void MnkInputDriver::ApplyMouseCaptureFromUIThread() {
+  if (!attached_window_) {
+    return;
+  }
+  const bool should_capture = mouse_capture_requested_.load(std::memory_order_relaxed);
 
-  if (should_capture && !mouse_captured_) {
-    mouse_captured_ = true;
+  if (should_capture && !mouse_captured_.load(std::memory_order_relaxed)) {
+    mouse_captured_.store(true, std::memory_order_relaxed);
     attached_window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
     attached_window_->CaptureMouse();
+    // Raw input (WM_INPUT): deltas without Windows pointer acceleration.
+    if (REXCVAR_GET(mnk_use_raw_input)) {
+      bool raw_ok = attached_window_->SetRawMouseMotion(
+          true, [this](int32_t dx, int32_t dy) {
+            std::lock_guard lock(state_mutex_);
+            raw_mouse_dx_ += static_cast<float>(dx);
+            raw_mouse_dy_ += static_cast<float>(dy);
+          });
+      raw_input_active_.store(raw_ok, std::memory_order_relaxed);
+      if (!raw_ok) {
+        REXLOG_WARN("MnK: raw input unavailable, mouse look falls back to window events");
+      }
+    }
     // Reset deltas to avoid a spike on capture start
+    std::lock_guard lock(state_mutex_);
     mouse_dx_ = 0;
     mouse_dy_ = 0;
-  } else if (!should_capture && mouse_captured_) {
-    mouse_captured_ = false;
+    raw_mouse_dx_ = 0.0f;
+    raw_mouse_dy_ = 0.0f;
+  } else if (!should_capture && mouse_captured_.load(std::memory_order_relaxed)) {
+    mouse_captured_.store(false, std::memory_order_relaxed);
+    if (raw_input_active_.exchange(false, std::memory_order_relaxed)) {
+      attached_window_->SetRawMouseMotion(false, nullptr);
+    }
     attached_window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kVisible);
     attached_window_->ReleaseMouse();
   }
 
-  // Re-center cursor each frame while captured to prevent edge clamping
-  if (mouse_captured_) {
+  // Re-center while captured to prevent edge clamping (coalesced to at most
+  // one recenter per queued post, i.e. roughly per guest poll).
+  if (mouse_captured_.load(std::memory_order_relaxed)) {
     CenterCursor();
   }
 }

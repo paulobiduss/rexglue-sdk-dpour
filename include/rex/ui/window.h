@@ -302,6 +302,17 @@ class Window {
   void CaptureMouse();
   void ReleaseMouse();
 
+  // DPOUR MIGRATION 2026-09-02: raw, unaccelerated relative mouse motion
+  // (Win32 WM_INPUT). A platform window that supports it delivers deltas to
+  // the callback on the UI thread and returns true; the base returns false.
+  // Call from the UI thread only.
+  using RawMouseMotionCallback = std::function<void(int32_t dx, int32_t dy)>;
+  virtual bool SetRawMouseMotion(bool enable, RawMouseMotionCallback callback) {
+    (void)enable;
+    (void)callback;
+    return false;
+  }
+
   // Desired state stored by the common Window, externally modifiable, read-only
   // in the implementation.
   CursorVisibility GetCursorVisibility() const { return cursor_visibility_; }

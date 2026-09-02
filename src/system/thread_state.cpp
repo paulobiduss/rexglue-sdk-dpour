@@ -32,8 +32,9 @@ ThreadState::ThreadState(uint32_t thread_id, uint32_t stack_base, uint32_t pcr_a
     thread_id_ = 0x80000000 | system_thread_handle;
   }
 
-  // Initialize the PPCContext (context_ already points to context_storage_)
-  std::memset(context_, 0, sizeof(::PPCContext));
+  // DPOUR MIGRATION 2026-09-02 (upstream 263a125): context_storage_ is
+  // value-initialized in the header; the memset that lived here ran after the
+  // PPCContext defaults and destroyed them.
 
   // Set initial registers
   context_->r1.u64 = stack_base;    // Stack pointer

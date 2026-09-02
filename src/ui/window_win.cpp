@@ -1027,7 +1027,54 @@ void Win32Window::AutoHideCursorTimerCallback(void* parameter, BOOLEAN timer_or_
   SendMessage(window.hwnd_, kUserMessageAutoHideCursor, window.last_cursor_auto_hide_signaled, 0);
 }
 
+bool Win32Window::SetRawMouseMotion(bool enable, RawMouseMotionCallback callback) {
+  // DPOUR MIGRATION 2026-09-02: raw input bypasses Windows pointer
+  // acceleration, so mouse-look deltas match physical motion. UI thread only,
+  // same as the WndProc that consumes the registration.
+  if (!hwnd_) {
+    return false;
+  }
+  RAWINPUTDEVICE rid = {};
+  rid.usUsagePage = 0x01;  // HID_USAGE_PAGE_GENERIC
+  rid.usUsage = 0x02;      // HID_USAGE_GENERIC_MOUSE
+  if (enable) {
+    rid.dwFlags = 0;  // deliver to hwnd_ while it is in the foreground
+    rid.hwndTarget = hwnd_;
+    if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
+      REXLOG_WARN("RegisterRawInputDevices failed (error {}), raw mouse motion unavailable",
+                  GetLastError());
+      return false;
+    }
+    raw_mouse_motion_callback_ = std::move(callback);
+    return true;
+  }
+  raw_mouse_motion_callback_ = nullptr;
+  rid.dwFlags = RIDEV_REMOVE;
+  rid.hwndTarget = nullptr;
+  RegisterRawInputDevices(&rid, 1, sizeof(rid));
+  return true;
+}
+
 LRESULT Win32Window::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
+  if (message == WM_INPUT) {
+    // DPOUR MIGRATION 2026-09-02: raw relative mouse motion for MnK look.
+    // Injected moves (our own recenter SetCursorPos) arrive flagged absolute
+    // and are filtered out, so recentering cannot feed back into the look.
+    if (raw_mouse_motion_callback_) {
+      RAWINPUT raw;
+      UINT raw_size = sizeof(raw);
+      if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, &raw, &raw_size,
+                          sizeof(RAWINPUTHEADER)) != UINT(-1) &&
+          raw.header.dwType == RIM_TYPEMOUSE &&
+          !(raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+        if (raw.data.mouse.lLastX != 0 || raw.data.mouse.lLastY != 0) {
+          raw_mouse_motion_callback_(raw.data.mouse.lLastX, raw.data.mouse.lLastY);
+        }
+      }
+    }
+    // WM_INPUT must still reach DefWindowProc for system-side cleanup.
+    return DefWindowProcW(hWnd, message, wParam, lParam);
+  }
   if (message >= WM_MOUSEFIRST && message <= WM_MOUSELAST) {
     WindowDestructionReceiver destruction_receiver(this);
     // Returning immediately anyway - no need to check
