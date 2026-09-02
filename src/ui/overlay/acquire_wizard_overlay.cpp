@@ -146,10 +146,17 @@ void AcquireWizardDialog::OnDraw(ImGuiIO& io) {
     }
 
     ImGui::Spacing();
+    // dpour-fork 2026-09-02: size buttons from their label instead of fixed
+    // widths - the ISO installer's "Select disc image..." clipped at 180 px.
+    auto button_width = [](const std::string& label, float min_width) {
+      const float text_width = ImGui::CalcTextSize(label.c_str()).x;
+      return std::max(min_width, text_width + ImGui::GetStyle().FramePadding.x * 2.0f + 24.0f);
+    };
     if (state_ == State::kWaitingForChoice || state_ == State::kFailed) {
       bool first_button = true;
       if (fetch_ && !options_.fetch_button_label.empty()) {
-        if (ImGui::Button(options_.fetch_button_label.c_str(), ImVec2(220.0f, 42.0f))) {
+        if (ImGui::Button(options_.fetch_button_label.c_str(),
+                          ImVec2(button_width(options_.fetch_button_label, 220.0f), 42.0f))) {
           StartFetch();
         }
         first_button = false;
@@ -158,12 +165,14 @@ void AcquireWizardDialog::OnDraw(ImGuiIO& io) {
         if (!first_button) {
           ImGui::SameLine();
         }
-        if (ImGui::Button(options_.pick_button_label.c_str(), ImVec2(180.0f, 42.0f))) {
+        if (ImGui::Button(options_.pick_button_label.c_str(),
+                          ImVec2(button_width(options_.pick_button_label, 180.0f), 42.0f))) {
           PickSourceAndInstall();
         }
       }
     } else if (state_ == State::kDone) {
-      if (ImGui::Button(options_.done_button_label.c_str(), ImVec2(160.0f, 42.0f))) {
+      if (ImGui::Button(options_.done_button_label.c_str(),
+                        ImVec2(button_width(options_.done_button_label, 160.0f), 42.0f))) {
         auto complete = std::move(complete_);
         Close();
         if (complete) {
