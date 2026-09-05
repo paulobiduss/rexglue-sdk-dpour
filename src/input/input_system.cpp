@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <mutex>
+#include <shared_mutex>
 
 #include <rex/dbg.h>
 #include <rex/input/flags.h>
@@ -52,6 +54,7 @@ X_STATUS InputSystem::Setup() {
 }
 
 void InputSystem::Shutdown() {
+  std::unique_lock<std::shared_mutex> lock(drivers_mutex_);
   if (window_) {
     rex::ui::UIEvent closing_event(window_);
     for (auto& driver : drivers_) {
@@ -65,10 +68,12 @@ void InputSystem::Shutdown() {
 }
 
 void InputSystem::AddDriver(std::unique_ptr<InputDriver> driver) {
+  std::unique_lock<std::shared_mutex> lock(drivers_mutex_);
   drivers_.push_back(std::move(driver));
 }
 
 void InputSystem::AttachWindow(rex::ui::Window* window) {
+  std::shared_lock<std::shared_mutex> drivers_lock(drivers_mutex_);
   window_ = window;
   for (auto& driver : drivers_) {
     driver->OnWindowAvailable(window);
@@ -76,6 +81,7 @@ void InputSystem::AttachWindow(rex::ui::Window* window) {
 }
 
 void InputSystem::SetActiveCallback(std::function<bool()> callback) {
+  std::shared_lock<std::shared_mutex> drivers_lock(drivers_mutex_);
   active_callback_ = callback;
   for (auto& driver : drivers_) {
     driver->set_is_active_callback(callback);
@@ -88,6 +94,7 @@ void InputSystem::SetMenuChordCallback(std::function<void()> callback) {
 
 X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
                                       X_INPUT_CAPABILITIES* out_caps) {
+  std::shared_lock<std::shared_mutex> drivers_lock(drivers_mutex_);
   SCOPE_profile_cpu_f("hid");
 
   bool any_connected = false;
@@ -104,6 +111,7 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
 }
 
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+  std::shared_lock<std::shared_mutex> drivers_lock(drivers_mutex_);
   SCOPE_profile_cpu_f("hid");
 
   bool any_connected = false;
@@ -168,6 +176,7 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
 }
 
 X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
+  std::shared_lock<std::shared_mutex> drivers_lock(drivers_mutex_);
   SCOPE_profile_cpu_f("hid");
 
   bool any_connected = false;
@@ -185,6 +194,7 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
 
 X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
                                    X_INPUT_KEYSTROKE* out_keystroke) {
+  std::shared_lock<std::shared_mutex> drivers_lock(drivers_mutex_);
   SCOPE_profile_cpu_f("hid");
 
   bool any_connected = false;

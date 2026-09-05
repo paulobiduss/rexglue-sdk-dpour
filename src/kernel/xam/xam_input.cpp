@@ -34,8 +34,18 @@ using rex::input::X_INPUT_VIBRATION;
 constexpr uint32_t XINPUT_FLAG_GAMEPAD = 0x01;
 constexpr uint32_t XINPUT_FLAG_ANY_USER = 1 << 30;
 
+// May return null: guest threads keep polling input while the host tears the
+// runtime down (window close -> TerminateTitle), so every caller must check.
 rex::input::InputSystem* input_system() {
-  return static_cast<rex::input::InputSystem*>(REX_KERNEL_STATE()->emulator()->input_system());
+  auto* kernel_state = REX_KERNEL_STATE();
+  if (!kernel_state) {
+    return nullptr;
+  }
+  auto* emulator = kernel_state->emulator();
+  if (!emulator) {
+    return nullptr;
+  }
+  return static_cast<rex::input::InputSystem*>(emulator->input_system());
 }
 
 void XamResetInactivity_entry() {
@@ -66,6 +76,9 @@ u32 XamInputGetCapabilities_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_C
   }
 
   auto* is = input_system();
+  if (!is) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
   return is->GetCapabilities(actual_user_index, flags, caps);
 }
 
@@ -88,6 +101,9 @@ u32 XamInputGetCapabilitiesEx_entry(u32 unk, u32 user_index, u32 flags,
 
   (void)unk;  // Unused in this implementation
   auto* is = input_system();
+  if (!is) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
   return is->GetCapabilities(actual_user_index, flags, caps);
 }
 
@@ -112,6 +128,9 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
   }
 
   auto* is = input_system();
+  if (!is) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
   return is->GetState(actual_user_index, input_state);
 }
 
@@ -129,6 +148,9 @@ u32 XamInputSetState_entry(u32 user_index, u32 unk, ppc_ptr_t<X_INPUT_VIBRATION>
 
   (void)unk;  // Unused in this implementation
   auto* is = input_system();
+  if (!is) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
   return is->SetState(actual_user_index, vibration);
 }
 
@@ -154,6 +176,9 @@ u32 XamInputGetKeystroke_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_KEYS
   }
 
   auto* is = input_system();
+  if (!is) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
   return is->GetKeystroke(actual_user_index, flags, keystroke);
 }
 
@@ -176,6 +201,9 @@ u32 XamInputGetKeystrokeEx_entry(mapped_u32 user_index_ptr, u32 flags,
   }
 
   auto* is = input_system();
+  if (!is) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
   auto result = is->GetKeystroke(user_index, flags, keystroke);
   if (XSUCCEEDED(result)) {
     *user_index_ptr = keystroke->user_index;

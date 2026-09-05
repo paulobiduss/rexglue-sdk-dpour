@@ -12,6 +12,7 @@
 
 #include <memory>
 #include <functional>
+#include <shared_mutex>
 #include <vector>
 
 #include <rex/input/input.h>
@@ -47,6 +48,10 @@ class InputSystem : public system::IInputSystem {
  private:
   rex::ui::Window* window_ = nullptr;
 
+  // Guest threads poll GetState/GetKeystroke while the UI thread can clear the
+  // driver list in Shutdown(). Readers take a shared lock, Shutdown/AddDriver
+  // take it exclusively.
+  mutable std::shared_mutex drivers_mutex_;
   std::vector<std::unique_ptr<InputDriver>> drivers_;
   std::function<bool()> active_callback_ = nullptr;
   std::function<void()> menu_chord_callback_ = nullptr;
