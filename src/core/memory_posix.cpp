@@ -15,6 +15,7 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <vector>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -62,6 +63,7 @@ void AlignHostPageRange(void*& base_address, size_t& length) {
 
 }  // namespace
 
+#if !REX_PLATFORM_ANDROID && !REX_PLATFORM_MAC
 // Convert filesystem path to valid shm_open name (must start with /, no other slashes)
 static std::string MakeShmName(const std::filesystem::path& path) {
   std::string name = path.string();
@@ -74,6 +76,7 @@ static std::string MakeShmName(const std::filesystem::path& path) {
   }
   return name;
 }
+#endif
 
 #if REX_PLATFORM_ANDROID
 // May be null if no dynamically loaded functions are required.
@@ -388,6 +391,32 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
     return kFileMappingHandleInvalid;
   }
   return static_cast<FileMappingHandle>(ashmem_fd);
+#elif REX_PLATFORM_MAC
+  // Darwin limits POSIX shared-memory objects well below the 4.5 GiB guest
+  // backing store. A temporary regular file has the same MAP_SHARED aliasing
+  // semantics, stays sparse until pages are touched, and can be unlinked
+  // immediately so a crash cannot leave a file behind.
+  (void)path;
+  (void)access;
+  (void)commit;
+  std::error_code error;
+  const auto temp_path = std::filesystem::temp_directory_path(error) / "rexglue-memory-XXXXXX";
+  if (error) {
+    return kFileMappingHandleInvalid;
+  }
+  std::string template_path = temp_path.string();
+  std::vector<char> template_buffer(template_path.begin(), template_path.end());
+  template_buffer.push_back('\0');
+  const int ret = mkstemp(template_buffer.data());
+  if (ret < 0) {
+    return kFileMappingHandleInvalid;
+  }
+  if (unlink(template_buffer.data()) != 0 ||
+      ftruncate64(ret, static_cast<off_t>(length)) != 0) {
+    close(ret);
+    return kFileMappingHandleInvalid;
+  }
+  return static_cast<FileMappingHandle>(ret);
 #else
   int oflag;
   switch (access) {
@@ -422,8 +451,11 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
 }
 
 void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path) {
+#if REX_PLATFORM_MAC
+  (void)path;
+#endif
   close(static_cast<int>(handle));
-#if !REX_PLATFORM_ANDROID
+#if !REX_PLATFORM_ANDROID && !REX_PLATFORM_MAC
   auto full_path = MakeShmName(path);
   shm_unlink(full_path.c_str());
 #endif
