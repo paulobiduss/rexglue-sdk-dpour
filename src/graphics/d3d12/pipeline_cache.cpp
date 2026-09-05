@@ -4436,15 +4436,3 @@ PsoCompileIndicatorState& PsoCompileIndicatorStateRef() {
 }
 
 }  // namespace rex::graphics::d3d12
-
-namespace rex::perf {
-
-GuestCpuStallMetrics& GuestCpuStallMetricsRef() {
-  // Same function-static cross-module pattern. Writers: kernel TUs that
-  // wrap NtCreate/Read/Write/Close, RtlAllocateHeap and friends, and the
-  // NtWaitForSingleObject path. Reader/drainer: PipelineCache::ReportFrameBoundary.
-  static GuestCpuStallMetrics metrics;
-  return metrics;
-}
-
-}  // namespace rex::perf

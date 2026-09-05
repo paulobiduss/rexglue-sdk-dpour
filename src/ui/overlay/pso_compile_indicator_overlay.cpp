@@ -31,6 +31,19 @@ REXCVAR_DEFINE_BOOL(shader_compile_indicator_verbose, false, "UI",
                     "library stores) under the indicator line.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+#if !defined(REX_HAS_D3D12)
+namespace rex::graphics::d3d12 {
+
+PsoCompileIndicatorState& PsoCompileIndicatorStateRef() {
+  // The indicator reports D3D12 pipeline-cache activity. Keep the UI linkable
+  // for Vulkan-only builds; no D3D12 work means the state remains empty.
+  static PsoCompileIndicatorState state;
+  return state;
+}
+
+}  // namespace rex::graphics::d3d12
+#endif
+
 namespace rex::ui {
 
 namespace {

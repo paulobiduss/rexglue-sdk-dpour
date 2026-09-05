@@ -11,9 +11,9 @@
  * frame by PipelineCache::ReportFrameBoundary. The kernel TUs increment them
  * via a tiny RAII scoped timer; cost ≈ 30 ns RDTSC pair per call.
  *
- * Storage lives next to PsoStallPresentNsAccumulator in pipeline_cache.cpp so
- * the kernel CMake target doesn't have to depend on the full PipelineCache
- * header (which transitively pulls xxhash + lots of graphics types).
+ * Storage lives in the core library so kernel instrumentation is available to
+ * every graphics backend without depending on a backend-specific pipeline
+ * cache implementation.
  */
 
 #pragma once
@@ -41,7 +41,7 @@ struct GuestCpuStallMetrics {
   std::atomic<uint32_t> frame_wait_count{0};
 };
 
-// Single process-wide instance. Storage in pipeline_cache.cpp.
+// Single process-wide instance. Storage in core/perf/guest_cpu_stall_metrics.cpp.
 GuestCpuStallMetrics& GuestCpuStallMetricsRef();
 
 enum class GuestCpuBucket : uint8_t {
