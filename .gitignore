@@ -427,3 +427,6 @@ CMakeUserPresets.json
 **/*.backup
 **/*.bak
 **/*.bak2
+
+# macOS Finder metadata
+.DS_Store

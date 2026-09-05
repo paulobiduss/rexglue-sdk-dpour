@@ -236,6 +236,11 @@ class VulkanPresenter final : public Presenter {
     kGuestOutputPaintPipelineLayoutIndexFsrEasu,
     kGuestOutputPaintPipelineLayoutIndexFsrRcas,
 #endif
+    // Downpour additions. These are not FidelityFX-dependent, so they live
+    // outside the guard - the macOS/Linux Vulkan builds configure with
+    // REXGLUE_ENABLE_FIDELITYFX=OFF and still reach both effects.
+    kGuestOutputPaintPipelineLayoutIndexColourGrade,
+    kGuestOutputPaintPipelineLayoutIndexBox,
 
     kGuestOutputPaintPipelineLayoutCount,
   };
@@ -259,9 +264,20 @@ class VulkanPresenter final : public Presenter {
       case GuestOutputPaintEffect::kFsrRcasDither:
         return kGuestOutputPaintPipelineLayoutIndexFsrRcas;
 #endif
+      case GuestOutputPaintEffect::kColourGrade:
+        return kGuestOutputPaintPipelineLayoutIndexColourGrade;
+      case GuestOutputPaintEffect::kBox:
+      case GuestOutputPaintEffect::kBoxDither:
+        return kGuestOutputPaintPipelineLayoutIndexBox;
       default:
+        // Never return kGuestOutputPaintPipelineLayoutCount here. The result
+        // indexes guest_output_paint_pipeline_layouts_ directly, so the count
+        // is one past the end: it used to read the adjacent
+        // guest_output_paint_vs_ member and hand that VkShaderModule to
+        // vkCreateGraphicsPipelines as the layout, which MoltenVK then walked
+        // as an MVKPipelineLayout and crashed on.
         assert_unhandled_case(effect);
-        return kGuestOutputPaintPipelineLayoutCount;
+        return kGuestOutputPaintPipelineLayoutIndexBilinear;
     }
   }
 

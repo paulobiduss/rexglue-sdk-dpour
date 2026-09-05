@@ -15,6 +15,36 @@
 //   fxc /T ps_5_1 /E main /O3 /Fh guest_output_colour_grade_ps.h
 //       /Vn guest_output_colour_grade_ps guest_output_colour_grade_ps.hlsl
 
+// XE_VULKAN selects the SPIR-V resource contract instead of the D3D12 one.
+// The shader body below is shared verbatim; only the declarations differ.
+//
+// D3D12 binds the effect constants as a root-constants parameter at b0, so the
+// block starts at byte 0. Vulkan puts the vertex shader's rectangle constants
+// in bytes 0-15 of the same push-constant block and the fragment constants at
+// byte 16 (see VulkanPresenter::InitializeSurfaceIndependent). glslang ignores
+// [[vk::offset]], so the shift is expressed with HLSL packoffset registers,
+// where cN is byte N*16.
+#ifdef XE_VULKAN
+
+[[vk::push_constant]]
+cbuffer push_consts_xe {
+  int2  xe_bilinear_output_offset    : packoffset(c1);
+  float2 xe_bilinear_output_size_inv : packoffset(c1.z);
+  float3 xe_cg_lift                  : packoffset(c2);
+  float  xe_cg_saturation            : packoffset(c2.w);
+  float3 xe_cg_gain                  : packoffset(c3);
+  float  xe_cg_contrast              : packoffset(c3.w);
+  float3 xe_cg_gamma_inv             : packoffset(c4);
+  float  xe_cg_temperature           : packoffset(c4.w);
+  float3 xe_cg_tint                  : packoffset(c5);
+  float  xe_cg_intensity             : packoffset(c5.w);
+};
+
+[[vk::binding(0, 0)]] Texture2D<float4> xe_bilinear_source;
+[[vk::binding(1, 0)]] SamplerState xe_bilinear_sampler;
+
+#else  // XE_VULKAN
+
 cbuffer push_consts_xe : register(b0) {
   int2  xe_bilinear_output_offset;     // 0  (matches BilinearConstants)
   float2 xe_bilinear_output_size_inv;  // 8
@@ -31,6 +61,8 @@ cbuffer push_consts_xe : register(b0) {
 
 SamplerState xe_bilinear_sampler : register(s0);
 Texture2D<float4> xe_bilinear_source : register(t0);
+
+#endif  // XE_VULKAN
 
 static const float3 kLumaCoeff = float3(0.2126, 0.7152, 0.0722);  // Rec.709
 

@@ -186,6 +186,11 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/guest_output_ffx_fsr_rcas_dither_ps.h"
 #include "../shaders/vulkan_spirv/guest_output_ffx_fsr_rcas_ps.h"
 #endif
+// Generated with scripts/build_vulkan_shaders.sh from the shared HLSL in
+// src/ui/shaders/source_d3d12/ (compiled with -DXE_VULKAN=1).
+#include "../shaders/vulkan_spirv/guest_output_box_dither_ps.h"
+#include "../shaders/vulkan_spirv/guest_output_box_ps.h"
+#include "../shaders/vulkan_spirv/guest_output_colour_grade_ps.h"
 #include "../shaders/vulkan_spirv/guest_output_triangle_strip_rect_vs.h"
 }  // namespace shaders
 
@@ -1889,6 +1894,25 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           // swapchain, for the render pass with the up-to-date image format.
           GuestOutputPaintEffect swapchain_effect =
               guest_output_flow.effects[guest_output_flow.effect_count - 1];
+          // Not every effect the shared paint-flow builder can pick has a
+          // SPIR-V fragment module in this backend. Rather than handing a null
+          // module to vkCreateGraphicsPipelines, fall back to the plain
+          // bilinear blit, which every Vulkan build always has. Rewrite the
+          // flow entry too - the draw loop below re-reads it to pick the
+          // pipeline layout and push constants.
+          if (guest_output_paint_fs_[size_t(swapchain_effect)] == VK_NULL_HANDLE) {
+            static bool
+                unsupported_effect_warned[size_t(GuestOutputPaintEffect::kCount)] = {};
+            if (!unsupported_effect_warned[size_t(swapchain_effect)]) {
+              unsupported_effect_warned[size_t(swapchain_effect)] = true;
+              REXLOG_WARN(
+                  "VulkanPresenter: No SPIR-V fragment shader for guest output "
+                  "paint effect {}; falling back to bilinear for presentation",
+                  size_t(swapchain_effect));
+            }
+            swapchain_effect = GuestOutputPaintEffect::kBilinear;
+            guest_output_flow.effects[guest_output_flow.effect_count - 1] = swapchain_effect;
+          }
           PaintContext::GuestOutputPaintPipeline& swapchain_effect_pipeline =
               paint_context_.guest_output_paint_pipelines[size_t(swapchain_effect)];
           if (swapchain_effect_pipeline.swapchain_pipeline != VK_NULL_HANDLE &&
@@ -1902,7 +1926,6 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           }
           if (swapchain_effect_pipeline.swapchain_pipeline == VK_NULL_HANDLE) {
             assert_true(CanGuestOutputPaintEffectBeFinal(swapchain_effect));
-            assert_true(guest_output_paint_fs_[size_t(swapchain_effect)] != VK_NULL_HANDLE);
             swapchain_effect_pipeline.swapchain_pipeline = CreateGuestOutputPaintPipeline(
                 swapchain_effect, paint_context_.swapchain_render_pass);
             if (swapchain_effect_pipeline.swapchain_pipeline == VK_NULL_HANDLE) {
@@ -2103,6 +2126,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
             FsrEasuConstants fsr_easu;
             FsrRcasConstants fsr_rcas;
 #endif
+            ColourGradeConstants colour_grade;
+            BoxConstants box;
           } effect_constants;
           switch (guest_output_paint_pipeline_layout_index) {
             case kGuestOutputPaintPipelineLayoutIndexBilinear: {
@@ -2129,6 +2154,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
               effect_constants.fsr_rcas.Initialize(guest_output_flow, i, guest_output_paint_config);
             } break;
 #endif
+            case kGuestOutputPaintPipelineLayoutIndexColourGrade: {
+              effect_constants_size = sizeof(effect_constants.colour_grade);
+              Presenter::InitializeColourGradeConstants(effect_constants.colour_grade,
+                                                        guest_output_flow, i);
+            } break;
+            case kGuestOutputPaintPipelineLayoutIndexBox: {
+              effect_constants_size = sizeof(effect_constants.box);
+              effect_constants.box.Initialize(guest_output_flow, i);
+            } break;
             default:
               break;
           }
@@ -2431,6 +2465,12 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
         guest_output_paint_push_constant_range_ffx.size = sizeof(FsrRcasConstants);
         break;
 #endif
+      case kGuestOutputPaintPipelineLayoutIndexColourGrade:
+        guest_output_paint_push_constant_range_ffx.size = sizeof(ColourGradeConstants);
+        break;
+      case kGuestOutputPaintPipelineLayoutIndexBox:
+        guest_output_paint_push_constant_range_ffx.size = sizeof(BoxConstants);
+        break;
       default:
         assert_unhandled_case(GuestOutputPaintPipelineLayoutIndex(i));
         continue;
@@ -2504,6 +2544,18 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
         shader_module_create_info.pCode = shaders::guest_output_ffx_fsr_rcas_dither_ps;
         break;
 #endif
+      case GuestOutputPaintEffect::kColourGrade:
+        shader_module_create_info.codeSize = sizeof(shaders::guest_output_colour_grade_ps);
+        shader_module_create_info.pCode = shaders::guest_output_colour_grade_ps;
+        break;
+      case GuestOutputPaintEffect::kBox:
+        shader_module_create_info.codeSize = sizeof(shaders::guest_output_box_ps);
+        shader_module_create_info.pCode = shaders::guest_output_box_ps;
+        break;
+      case GuestOutputPaintEffect::kBoxDither:
+        shader_module_create_info.codeSize = sizeof(shaders::guest_output_box_dither_ps);
+        shader_module_create_info.pCode = shaders::guest_output_box_dither_ps;
+        break;
       default:
         // Not supported by this implementation.
         continue;
