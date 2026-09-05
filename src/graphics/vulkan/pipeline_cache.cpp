@@ -392,6 +392,26 @@ bool VulkanPipelineCache::Initialize() {
 void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                                   uint32_t title_id, bool blocking) {
   ShutdownShaderStorage();
+  // Feed the launch-time compile-progress overlay, the same way the D3D12
+  // cache does. Without this the window sits frozen for minutes on a cold
+  // MoltenVK cache with no indication that anything is happening.
+  auto& progress = command_processor_.graphics_system()->shader_storage_progress();
+  progress.shaders_translated.store(0, std::memory_order_relaxed);
+  progress.pipelines_created.store(0, std::memory_order_relaxed);
+  progress.pipelines_total.store(0, std::memory_order_relaxed);
+  progress.finished.store(false, std::memory_order_relaxed);
+  progress.in_progress.store(true, std::memory_order_release);
+  // The overlay waits on `finished` before it lets the guest thread start, and
+  // this function has several early returns (missing or unusable cache files).
+  // Publish completion from a scope guard so no exit path can strand the
+  // dialog - and with it the whole launch - waiting forever.
+  struct ProgressCompletion {
+    rex::graphics::GraphicsSystem::ShaderStorageProgressCounters& counters;
+    ~ProgressCompletion() {
+      counters.finished.store(true, std::memory_order_release);
+      counters.in_progress.store(false, std::memory_order_release);
+    }
+  } progress_completion{progress};
   {
     std::lock_guard<std::mutex> lock(creation_request_lock_);
     startup_loading_ = false;
@@ -584,6 +604,7 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
         shader->DestroyTranslation(translation_needed.second);
       }
     }
+    progress.shaders_translated.fetch_add(1, std::memory_order_relaxed);
   }
 
   // Create the pipelines.
@@ -648,9 +669,12 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     }
     creation_thread_count = std::min(creation_thread_count, pipeline_creations.size());
 
+    progress.pipelines_total.store(uint32_t(pipeline_creations.size()),
+                                   std::memory_order_release);
+
     std::atomic<size_t> next_creation_index(0);
     std::atomic<size_t> created_pipeline_count(0);
-    auto creation_worker = [this, &pipeline_creations, &next_creation_index,
+    auto creation_worker = [this, &progress, &pipeline_creations, &next_creation_index,
                             &created_pipeline_count]() {
       while (true) {
         size_t creation_index = next_creation_index.fetch_add(1);
@@ -660,6 +684,9 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
         if (EnsurePipelineCreated(pipeline_creations[creation_index])) {
           created_pipeline_count.fetch_add(1);
         }
+        // Count attempts, not successes - the bar tracks work done, and a
+        // pipeline that fails to compile still consumed the time.
+        progress.pipelines_created.fetch_add(1, std::memory_order_relaxed);
       }
     };
 

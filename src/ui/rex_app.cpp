@@ -76,7 +76,11 @@ namespace rex {
 namespace {
 
 constexpr bool kBlockShaderStorageStartup =
-#if REX_PLATFORM_WIN32
+#if REX_PLATFORM_WIN32 || REX_PLATFORM_MAC
+    // macOS needs this as much as Windows does, and arguably more: MoltenVK
+    // compiles every pipeline through the Metal shader compiler at startup, so
+    // a cold cache blocks for minutes. Without the dialog the window is simply
+    // frozen with nothing on screen.
     true;
 #else
     false;
@@ -750,8 +754,13 @@ void ReXApp::LaunchModule() {
           std::make_shared<system::object_ref<system::XThread>>(std::move(main_thread));
       new rex::ui::ShaderCompileDialog(
           imgui_drawer_.get(), graphics_system, "Preparing shaders",
+#if REX_PLATFORM_MAC
+          "Warming the Metal pipeline cache for the current render path. "
+          "This only runs in full once per cache; later launches are fast.",
+#else
           "Warming the D3D12 pipeline cache for the current render path. "
           "This only runs in full once per cache; later launches are fast.",
+#endif
           [this, main_thread_shared]() mutable {
             // Already on UI thread (dialog renders here).
             FinishModuleLaunch(std::move(*main_thread_shared));
